@@ -11,17 +11,69 @@ use super::identifiers::ToolName;
 // ============================================================================
 
 /// Permission modes for tool execution
+///
+/// Claude Code 2.1.292 accepts `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`
+/// and `plan` on `--permission-mode`, plus the older `default` (an alias of `manual` that the
+/// CLI still reports in its init message).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum PermissionMode {
-    /// Default mode - CLI prompts for dangerous tools
+    /// Default mode - CLI prompts for dangerous tools (`default`, same as [`Self::Manual`])
     Default,
+    /// Ask for every action no rule decides (`manual`; reported back as `default`)
+    Manual,
     /// Auto-accept file edits
     AcceptEdits,
     /// Plan mode
     Plan,
+    /// Claude Code's auto mode: a classifier approves routine actions and asks for the rest
+    Auto,
+    /// Deny anything that would prompt, without asking
+    DontAsk,
     /// Allow all tools (use with caution)
     BypassPermissions,
+}
+
+impl PermissionMode {
+    /// The value for `--permission-mode`.
+    #[must_use]
+    pub fn cli_value(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Manual => "manual",
+            Self::AcceptEdits => "acceptEdits",
+            Self::Plan => "plan",
+            Self::Auto => "auto",
+            Self::DontAsk => "dontAsk",
+            Self::BypassPermissions => "bypassPermissions",
+        }
+    }
+
+    /// The value for the `set_permission_mode` control request, which rejects `manual` and
+    /// takes `default` for it.
+    #[must_use]
+    pub fn control_value(self) -> &'static str {
+        match self {
+            Self::Manual => "default",
+            other => other.cli_value(),
+        }
+    }
+
+    /// Parses a mode as the CLI reports it (`permissionMode` in the init message).
+    #[must_use]
+    pub fn from_cli_value(value: &str) -> Option<Self> {
+        Some(match value {
+            "default" => Self::Default,
+            "manual" => Self::Manual,
+            "acceptEdits" => Self::AcceptEdits,
+            "plan" => Self::Plan,
+            "auto" => Self::Auto,
+            "dontAsk" => Self::DontAsk,
+            "bypassPermissions" => Self::BypassPermissions,
+            _ => return None,
+        })
+    }
 }
 
 /// Setting source types

@@ -175,18 +175,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         name,
                                         input,
                                         ..
-                                    } => {
-                                        if name == "Task" {
-                                            let subagent_type = input
-                                                .get("subagent_type")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("unknown");
-                                            info!(
-                                                tool = %name,
-                                                subagent_type = %subagent_type,
-                                                "Task tool invoked"
-                                            );
-                                        }
+                                    } if name == "Task" => {
+                                        let subagent_type = input
+                                            .get("subagent_type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown");
+                                        info!(
+                                            tool = %name,
+                                            subagent_type = %subagent_type,
+                                            "Task tool invoked"
+                                        );
                                     }
                                     _ => {}
                                 }

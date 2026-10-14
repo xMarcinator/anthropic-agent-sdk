@@ -174,6 +174,7 @@ impl OutputFormat {
 
 /// Network-specific configuration for sandbox mode
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NetworkSandboxSettings {
     /// Allow processes to bind to local ports
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -194,6 +195,7 @@ pub struct NetworkSandboxSettings {
 
 /// Configuration for ignoring specific sandbox violations
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SandboxIgnoreViolations {
     /// File path patterns to ignore violations for
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,6 +207,7 @@ pub struct SandboxIgnoreViolations {
 
 /// Configuration for sandbox behavior
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SandboxSettings {
     /// Enable sandbox mode for command execution
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -255,6 +258,207 @@ pub enum SdkBeta {
     /// 1 million token context window (compatible with Claude Sonnet 4, Claude Sonnet 4.5)
     #[serde(rename = "context-1m-2025-08-07")]
     Context1M,
+}
+
+impl SdkBeta {
+    /// The value for `--betas`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Context1M => "context-1m-2025-08-07",
+        }
+    }
+}
+
+// ============================================================================
+// Effort, thinking and permission prompts
+// ============================================================================
+
+/// Effort level for the session (`--effort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    /// `low`
+    Low,
+    /// `medium`
+    Medium,
+    /// `high`
+    High,
+    /// `xhigh`
+    XHigh,
+    /// `max`
+    Max,
+}
+
+impl Effort {
+    /// The value for `--effort`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl std::str::FromStr for Effort {
+    type Err = crate::ClaudeError;
+
+    fn from_str(value: &str) -> crate::Result<Self> {
+        Ok(match value {
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" => Self::XHigh,
+            "max" => Self::Max,
+            _ => {
+                return Err(crate::ClaudeError::invalid_config(format!(
+                    "unknown effort '{value}': expected low, medium, high, xhigh or max"
+                )));
+            }
+        })
+    }
+}
+
+/// Extended thinking mode (`--thinking`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingMode {
+    /// `enabled`
+    Enabled,
+    /// `adaptive`: the model decides how much to think
+    Adaptive,
+    /// `disabled`
+    Disabled,
+}
+
+impl ThinkingMode {
+    /// The value for `--thinking`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Adaptive => "adaptive",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// Who answers permission prompts in print mode (`--permission-prompts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionPrompts {
+    /// The SDK host or `--permission-prompt-tool` answers (the CLI default)
+    Host,
+    /// Nobody: anything that would prompt is denied automatically
+    None,
+}
+
+impl PermissionPrompts {
+    /// The value for `--permission-prompts`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::None => "none",
+        }
+    }
+}
+
+// ============================================================================
+// Authentication and environment
+// ============================================================================
+
+/// How the CLI process authenticates.
+///
+/// With [`ClaudeAuth::ApiKey`] or [`ClaudeAuth::OAuthToken`] the process receives exactly that
+/// one credential variable; `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+/// `CLAUDE_CODE_OAUTH_TOKEN` inherited from the parent are dropped, since Claude Code ranks
+/// them above a subscription token. The secret never appears in `Debug` output.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum ClaudeAuth {
+    /// Use whatever the environment and the CLI's own login provide (the default)
+    #[default]
+    Inherit,
+    /// An Anthropic API key, passed as `ANTHROPIC_API_KEY`
+    ApiKey(String),
+    /// A long-lived subscription token from `claude setup-token`, passed as
+    /// `CLAUDE_CODE_OAUTH_TOKEN`
+    OAuthToken(String),
+}
+
+impl std::fmt::Debug for ClaudeAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Inherit => "Inherit",
+            Self::ApiKey(_) => "ApiKey(<redacted>)",
+            Self::OAuthToken(_) => "OAuthToken(<redacted>)",
+        })
+    }
+}
+
+impl ClaudeAuth {
+    /// Environment variables that carry a credential.
+    pub const CREDENTIAL_VARS: [&'static str; 3] = [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ];
+
+    /// The variable and value this credential sets, if any.
+    #[must_use]
+    pub fn env_var(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::Inherit => None,
+            Self::ApiKey(key) => Some(("ANTHROPIC_API_KEY", key)),
+            Self::OAuthToken(token) => Some(("CLAUDE_CODE_OAUTH_TOKEN", token)),
+        }
+    }
+}
+
+/// Which of the parent's environment variables the CLI process inherits.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum EnvInheritance {
+    /// Every variable (the default)
+    #[default]
+    All,
+    /// Only the named variables. An entry ending in `*` is a prefix (`CLAUDE_*`). Names compare
+    /// case-insensitively on Windows. `ClaudeAgentOptions::env`, the credential and the SDK's
+    /// own variables are added on top.
+    Only(Vec<String>),
+}
+
+impl EnvInheritance {
+    /// Whether the parent variable `name` is inherited.
+    #[must_use]
+    pub fn allows(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(patterns) => {
+                patterns
+                    .iter()
+                    .any(|pattern| match pattern.strip_suffix('*') {
+                        Some(prefix) => name
+                            .get(..prefix.len())
+                            .is_some_and(|head| env_name_eq(head, prefix)),
+                        None => env_name_eq(name, pattern),
+                    })
+            }
+        }
+    }
+}
+
+/// Whether two environment variable names are the same on this platform.
+#[must_use]
+pub fn env_name_eq(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
 }
 
 // ============================================================================
@@ -372,6 +576,9 @@ pub struct ClaudeAgentOptions {
     pub hooks: Option<HashMap<HookEvent, Vec<HookMatcher>>>,
 
     /// User identifier
+    ///
+    /// **Deprecated:** Claude Code has no `--user` flag (2.1.292 rejects it), so this value is
+    /// no longer passed to the CLI. It is kept for source compatibility only.
     #[builder(default, setter(strip_option, into))]
     pub user: Option<String>,
 
@@ -470,6 +677,74 @@ pub struct ClaudeAgentOptions {
     /// Either a list of tool names or a preset (e.g., `ToolsConfig::claude_code_preset()`).
     #[builder(default, setter(strip_option))]
     pub tools: Option<ToolsConfig>,
+
+    // ========================================================================
+    // Claude Code 2.1.x options
+    // ========================================================================
+    /// Effort level (`--effort low|medium|high|xhigh|max`)
+    #[builder(default, setter(strip_option))]
+    pub effort: Option<Effort>,
+
+    /// Context window variant of `model`, e.g. `"1m"` for `opus[1m]`. Requires `model`.
+    #[builder(default, setter(strip_option, into))]
+    pub model_context: Option<String>,
+
+    /// Extended thinking mode (`--thinking enabled|adaptive|disabled`)
+    #[builder(default, setter(strip_option))]
+    pub thinking: Option<ThinkingMode>,
+
+    /// Who answers permission prompts (`--permission-prompts host|none`)
+    #[builder(default, setter(strip_option))]
+    pub permission_prompts: Option<PermissionPrompts>,
+
+    /// Forward subagents' text and thinking as messages tagged with `parent_tool_use_id`
+    /// (`--forward-subagent-text`)
+    #[builder(default)]
+    pub forward_subagent_text: bool,
+
+    /// Emit every hook lifecycle event in the stream (`--include-hook-events`)
+    #[builder(default)]
+    pub include_hook_events: bool,
+
+    /// Do not save the session to disk; it cannot be resumed (`--no-session-persistence`)
+    #[builder(default)]
+    pub no_session_persistence: bool,
+
+    /// Display name for the session (`--name`)
+    #[builder(default, setter(strip_option, into))]
+    pub session_name: Option<String>,
+
+    /// Agent for the session (`--agent`)
+    #[builder(default, setter(strip_option, into))]
+    pub agent: Option<String>,
+
+    /// Minimal mode: skip hooks, plugins, auto-memory and CLAUDE.md discovery (`--bare`).
+    /// Anthropic auth is then strictly `ANTHROPIC_API_KEY`.
+    #[builder(default)]
+    pub bare: bool,
+
+    /// Restricted mode (`--restricted`): no command-running tools unless `tools` names them,
+    /// no user/project/local settings, file tools confined to the working directories.
+    #[builder(default)]
+    pub restricted: bool,
+
+    /// Move per-machine system prompt sections into the first user message for prompt-cache
+    /// reuse (`--exclude-dynamic-system-prompt-sections`)
+    #[builder(default)]
+    pub exclude_dynamic_system_prompt_sections: bool,
+
+    /// How the process authenticates (API key, `claude setup-token` token, or inherited)
+    #[builder(default)]
+    pub auth: ClaudeAuth,
+
+    /// Claude Code's configuration folder for this process (`CLAUDE_CONFIG_DIR`): where it keeps
+    /// settings, credentials and session transcripts (used by resume)
+    #[builder(default, setter(strip_option, into))]
+    pub config_dir: Option<PathBuf>,
+
+    /// Which parent environment variables the process inherits (default: all)
+    #[builder(default)]
+    pub env_inheritance: EnvInheritance,
 }
 
 impl ClaudeAgentOptions {
@@ -497,7 +772,7 @@ impl std::fmt::Debug for ClaudeAgentOptions {
             .field("cwd", &self.cwd)
             .field("settings", &self.settings)
             .field("add_dirs", &self.add_dirs)
-            .field("env", &self.env)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
             .field("extra_args", &self.extra_args)
             .field("max_buffer_size", &self.max_buffer_size)
             .field(
@@ -550,6 +825,24 @@ impl std::fmt::Debug for ClaudeAgentOptions {
                     ToolsConfig::Preset(p) => format!("preset:{}", p.preset),
                 }),
             )
+            .field("effort", &self.effort)
+            .field("model_context", &self.model_context)
+            .field("thinking", &self.thinking)
+            .field("permission_prompts", &self.permission_prompts)
+            .field("forward_subagent_text", &self.forward_subagent_text)
+            .field("include_hook_events", &self.include_hook_events)
+            .field("no_session_persistence", &self.no_session_persistence)
+            .field("session_name", &self.session_name)
+            .field("agent", &self.agent)
+            .field("bare", &self.bare)
+            .field("restricted", &self.restricted)
+            .field(
+                "exclude_dynamic_system_prompt_sections",
+                &self.exclude_dynamic_system_prompt_sections,
+            )
+            .field("auth", &self.auth)
+            .field("config_dir", &self.config_dir)
+            .field("env_inheritance", &self.env_inheritance)
             .finish()
     }
 }

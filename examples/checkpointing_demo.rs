@@ -133,6 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Message::StreamEvent { event, .. } => {
                                 tracing::trace!(event = %event, "Stream event");
                             }
+                            other => {
+                                tracing::debug!(kind = other.message_type(), "Other message");
+                            }
                         }
                     }
                     Err(e) => {

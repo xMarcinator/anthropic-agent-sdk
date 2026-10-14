@@ -1,5 +1,10 @@
 //! Control protocol for bidirectional communication with Claude Code
 //!
+//! **Wire format:** [`wire`] holds the messages Claude Code actually exchanges on stdin and
+//! stdout (`control_request` / `control_response` lines), and `ClaudeSDKClient` uses it.
+//! [`protocol::ProtocolHandler`] and its `ControlMessage` envelope describe an older,
+//! SDK-internal model that the CLI never spoke; they are kept only for source compatibility.
+//!
 //! This module implements the control protocol that enables bidirectional
 //! communication between the SDK and Claude Code CLI, including:
 //! - Request/response routing
@@ -62,7 +67,12 @@
 //! supports a different version, the connection will fail with an error.
 
 pub mod protocol;
+pub mod wire;
 
 pub use protocol::{
     ControlMessage, ControlRequest, ControlResponse, InitRequest, InitResponse, ProtocolHandler,
+};
+pub use wire::{
+    CanUseToolRequest, ControlRequestBody, ControlRequestEnvelope, ControlResponseBody,
+    ControlResponseEnvelope, InboundControlRequest,
 };

@@ -539,43 +539,41 @@ impl HookManager {
                 }
             }
 
-            Message::System { subtype, data } => {
+            Message::System { subtype, data } if subtype == "compact_boundary" => {
                 // Handle compact_boundary for PreCompact hook
-                if subtype == "compact_boundary" {
-                    let trigger = data
-                        .get("compact_metadata")
-                        .and_then(|m| m.get("trigger"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("auto");
+                let trigger = data
+                    .get("compact_metadata")
+                    .and_then(|m| m.get("trigger"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("auto");
 
-                    let precompact_input = serde_json::json!({
-                        "hook_event_name": "PreCompact",
-                        "session_id": self.session_id.as_deref().unwrap_or(""),
-                        "cwd": self.cwd.as_deref().unwrap_or(""),
-                        "transcript_path": "",
-                        "trigger": trigger,
-                        "custom_instructions": null,
-                    });
+                let precompact_input = serde_json::json!({
+                    "hook_event_name": "PreCompact",
+                    "session_id": self.session_id.as_deref().unwrap_or(""),
+                    "cwd": self.cwd.as_deref().unwrap_or(""),
+                    "transcript_path": "",
+                    "trigger": trigger,
+                    "custom_instructions": null,
+                });
 
-                    let output = self
-                        .invoke(
-                            HookEvent::PreCompact,
-                            precompact_input,
-                            None,
-                            context.clone(),
-                        )
-                        .await?;
+                let output = self
+                    .invoke(
+                        HookEvent::PreCompact,
+                        precompact_input,
+                        None,
+                        context.clone(),
+                    )
+                    .await?;
 
-                    if output.decision.is_some()
-                        || output.system_message.is_some()
-                        || output.hook_specific_output.is_some()
-                    {
-                        outputs.push(output);
-                    }
+                if output.decision.is_some()
+                    || output.system_message.is_some()
+                    || output.hook_specific_output.is_some()
+                {
+                    outputs.push(output);
                 }
             }
 
-            Message::StreamEvent { .. } => {}
+            _ => {}
         }
 
         Ok(outputs)

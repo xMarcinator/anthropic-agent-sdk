@@ -52,12 +52,14 @@ pub use mcp::{
 };
 pub use messages::{
     AskUserQuestionInput, AskUserQuestionOutput, AssistantMessageContent, ContentBlock,
-    ContentValue, Message, QuestionOption, QuestionSpec, UserContent, UserMessageContent,
+    ContentValue, Message, QuestionOption, QuestionSpec, RateLimitInfo, RateLimitType,
+    RateLimitWindow, SystemInit, Usage, UserContent, UserMessageContent,
 };
 pub use options::{
-    AgentDefinition, ClaudeAgentOptions, ClaudeAgentOptionsBuilder, NetworkSandboxSettings,
-    OutputFormat, SandboxIgnoreViolations, SandboxSettings, SdkBeta, SdkPluginConfig,
-    StderrCallback, SystemPrompt, SystemPromptPreset, ToolsConfig, ToolsPreset,
+    AgentDefinition, ClaudeAgentOptions, ClaudeAgentOptionsBuilder, ClaudeAuth, Effort,
+    EnvInheritance, NetworkSandboxSettings, OutputFormat, PermissionPrompts,
+    SandboxIgnoreViolations, SandboxSettings, SdkBeta, SdkPluginConfig, StderrCallback,
+    SystemPrompt, SystemPromptPreset, ThinkingMode, ToolsConfig, ToolsPreset,
 };
 pub use permissions::{
     CanUseToolCallback, PermissionBehavior, PermissionMode, PermissionRequest, PermissionResult,

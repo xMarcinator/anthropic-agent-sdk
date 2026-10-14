@@ -152,9 +152,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Simulate an Assistant message with Task tool use
     let task_message = Message::Assistant {
         parent_tool_use_id: None,
-        message: anthropic_agent_sdk::types::AssistantMessageContent {
-            model: "claude-sonnet-4-20250514".to_string(),
-            content: vec![ContentBlock::ToolUse {
+        message: anthropic_agent_sdk::types::AssistantMessageContent::new(
+            "claude-sonnet-4-20250514",
+            vec![ContentBlock::ToolUse {
                 id: "toolu_abc123".to_string(),
                 name: "Task".to_string(),
                 input: serde_json::json!({
@@ -163,8 +163,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "subagent_type": "general-purpose"
                 }),
             }],
-        },
+        ),
         session_id: None,
+        uuid: None,
+        error: None,
     };
 
     // Process the message - should trigger SubagentStart hook
@@ -188,6 +190,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         session_id: None,
         uuid: None,
+        is_replay: false,
+        is_synthetic: false,
+        timestamp: None,
     };
 
     // Process the result - should trigger SubagentStop hook
@@ -273,6 +278,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     Message::StreamEvent { .. } => {
                                         trace!("Stream event");
+                                    }
+                                    other => {
+                                        trace!(kind = other.message_type(), "Other message");
                                     }
                                 }
 
