@@ -309,7 +309,7 @@ pub use callbacks::{
     FnHookCallback, FnPermissionCallback, HookCallback, PermissionCallback, SharedHookCallback,
     SharedPermissionCallback,
 };
-pub use client::ClaudeSDKClient;
+pub use client::{ClaudeSDKClient, DEFAULT_CONTROL_TIMEOUT};
 pub use error::{ClaudeError, Result};
 pub use futures::StreamExt;
 pub use hooks::{HookManager, HookMatcherBuilder};
@@ -317,7 +317,8 @@ pub use message::parse_message;
 pub use permissions::{PermissionManager, PermissionManagerBuilder};
 pub use query::query;
 pub use transport::{
-    MIN_CLI_VERSION, PromptInput, SubprocessTransport, Transport, check_claude_version,
+    MIN_CLI_VERSION, PromptInput, SubprocessTransport, TESTED_CLI_VERSION, Transport,
+    check_claude_version,
 };
 pub use types::{
     AgentDefinition, CanUseToolCallback, ClaudeAgentOptions, ClaudeAgentOptionsBuilder,

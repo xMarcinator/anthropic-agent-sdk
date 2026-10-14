@@ -141,12 +141,17 @@
 //! # }
 //! ```
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::control::{ControlMessage, ControlRequest, ProtocolHandler};
+use crate::control::wire::{
+    CanUseToolRequest, ControlRequestBody, ControlRequestEnvelope, ControlResponseBody,
+    ControlResponseEnvelope, InboundControlRequest, permission_response_value,
+};
 use crate::error::{ClaudeError, Result};
 use crate::hooks::HookManager;
 use crate::message::parse_message;
@@ -154,7 +159,7 @@ use crate::permissions::PermissionManager;
 use crate::transport::{PromptInput, SubprocessTransport, Transport};
 use crate::types::{
     AccountInfo, ClaudeAgentOptions, HookEvent, Message, ModelInfo, PermissionRequest, RequestId,
-    SessionId, SessionInfo,
+    SessionId, SessionInfo, ToolName, ToolPermissionContext,
 };
 use futures::Stream;
 
@@ -164,15 +169,27 @@ type BufferedMessage = (Option<SessionId>, String);
 /// Thread-safe queue for buffering messages during streaming
 type MessageBuffer = Arc<std::sync::Mutex<VecDeque<BufferedMessage>>>;
 
+/// Control requests sent to the CLI that await its `control_response`, by request ID.
+type PendingControl = Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<ControlResponseBody>>>>;
+
+/// `can_use_tool` requests from the CLI that await a manual answer, by request ID.
+type PendingPermissions = Arc<std::sync::Mutex<HashMap<String, CanUseToolRequest>>>;
+
+/// How long control requests wait for the CLI's answer by default.
+pub const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Context for the message reader background task
 struct MessageReaderContext {
     transport: Arc<Mutex<SubprocessTransport>>,
-    protocol: Arc<Mutex<ProtocolHandler>>,
     message_tx: mpsc::UnboundedSender<Result<Message>>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     session_info: Arc<std::sync::Mutex<Option<SessionInfo>>>,
     bound_session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     hook_manager: Option<Arc<Mutex<HookManager>>>,
+    permission_manager: Option<Arc<Mutex<PermissionManager>>>,
+    permission_tx: mpsc::UnboundedSender<(RequestId, PermissionRequest)>,
+    pending_control: PendingControl,
+    pending_permissions: PendingPermissions,
     is_resume: bool,
 }
 
@@ -180,6 +197,11 @@ struct MessageReaderContext {
 ///
 /// `ClaudeSDKClient` provides interactive, stateful conversations with
 /// support for interrupts, hooks, and permission callbacks.
+///
+/// Control messages use Claude Code's stream-JSON control protocol: requests to the CLI
+/// (`interrupt`, `set_model`, ...) are correlated with their `control_response` by request ID,
+/// and the CLI's own requests (`can_use_tool` with `--permission-prompt-tool stdio`) are
+/// answered by the client. Neither appears in the message stream.
 ///
 /// # Examples
 ///
@@ -204,18 +226,13 @@ struct MessageReaderContext {
 pub struct ClaudeSDKClient {
     /// Transport layer
     transport: Arc<Mutex<SubprocessTransport>>,
-    /// Control protocol handler
-    protocol: Arc<Mutex<ProtocolHandler>>,
     /// Message stream receiver
     message_rx: mpsc::UnboundedReceiver<Result<Message>>,
-    /// Control message sender
-    control_tx: mpsc::UnboundedSender<ControlRequest>,
     /// Hook event receiver (if not using automatic handler)
     hook_rx: Option<mpsc::UnboundedReceiver<(String, HookEvent)>>,
     /// Permission request receiver (if not using automatic handler)
     permission_rx: Option<mpsc::UnboundedReceiver<(RequestId, PermissionRequest)>>,
     /// Hook manager for automatic hook handling (kept alive for background tasks)
-    #[allow(dead_code)]
     hook_manager: Option<Arc<Mutex<HookManager>>>,
     /// Permission manager for automatic permission handling (kept alive for background tasks)
     #[allow(dead_code)]
@@ -236,6 +253,29 @@ pub struct ClaudeSDKClient {
     message_buffer: MessageBuffer,
     /// Bound session ID - if set, all sends validate against this
     bound_session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
+    /// Control requests awaiting the CLI's answer
+    pending_control: PendingControl,
+    /// `can_use_tool` requests awaiting `respond_to_permission`
+    pending_permissions: PendingPermissions,
+}
+
+/// A fresh control request ID, unique within the process.
+fn next_request_id() -> String {
+    static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "req_{}_{:x}",
+        REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
+}
+
+/// Writes one line to the CLI's stdin.
+async fn write_line(transport: &Arc<Mutex<SubprocessTransport>>, line: &str) -> Result<()> {
+    let mut guard = transport.lock().await;
+    guard.write(line).await
 }
 
 impl ClaudeSDKClient {
@@ -264,17 +304,21 @@ impl ClaudeSDKClient {
             (None, Some(mpsc::unbounded_channel().1))
         };
 
-        // Initialize permission manager if callback is configured
+        // Permission requests (`can_use_tool`) go to the callback when one is configured,
+        // otherwise to the receiver returned by `take_permission_receiver`.
+        let (permission_tx, permission_rx_internal) = mpsc::unbounded_channel();
         let (permission_manager, permission_rx) = if options.can_use_tool.is_some() {
             let mut manager = PermissionManager::new();
             if let Some(callback) = options.can_use_tool.clone() {
                 manager.set_callback(callback);
             }
-            manager.set_allowed_tools(Some(options.allowed_tools.clone()));
+            if !options.allowed_tools.is_empty() {
+                manager.set_allowed_tools(Some(options.allowed_tools.clone()));
+            }
             manager.set_disallowed_tools(options.disallowed_tools.clone());
             (Some(Arc::new(Mutex::new(manager))), None)
         } else {
-            (None, Some(mpsc::unbounded_channel().1))
+            (None, Some(permission_rx_internal))
         };
 
         // Check if this is a resume session (for SessionStart hook)
@@ -292,79 +336,36 @@ impl ClaudeSDKClient {
         // Connect transport
         transport.connect().await?;
 
-        // Create protocol handler
-        let mut protocol = ProtocolHandler::new();
-
-        // Set up channels
-        let (hook_tx, hook_rx_internal) = mpsc::unbounded_channel();
-        let (permission_tx, permission_rx_internal) = mpsc::unbounded_channel();
-        protocol.set_hook_channel(hook_tx);
-        protocol.set_permission_channel(permission_tx);
-
         let (message_tx, message_rx) = mpsc::unbounded_channel();
-        let (control_tx, control_rx) = mpsc::unbounded_channel();
-
-        // Note: Claude CLI doesn't use a separate control protocol initialization.
-        // The stream-json mode expects user messages to be sent directly.
-        // Mark protocol as initialized immediately.
-        protocol.set_initialized(true);
 
         let transport = Arc::new(Mutex::new(transport));
-        let protocol = Arc::new(Mutex::new(protocol));
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_info = Arc::new(std::sync::Mutex::new(None));
         let bound_session_id = Arc::new(std::sync::Mutex::new(None));
+        let pending_control: PendingControl = Arc::default();
+        let pending_permissions: PendingPermissions = Arc::default();
 
         // Spawn message reader task
         let reader_ctx = MessageReaderContext {
             transport: transport.clone(),
-            protocol: protocol.clone(),
             message_tx,
             session_id: session_id.clone(),
             session_info: session_info.clone(),
             bound_session_id: bound_session_id.clone(),
             hook_manager: hook_manager.clone(),
+            permission_manager: permission_manager.clone(),
+            permission_tx,
+            pending_control: pending_control.clone(),
+            pending_permissions: pending_permissions.clone(),
             is_resume,
         };
         tokio::spawn(async move {
             Self::message_reader_task(reader_ctx).await;
         });
 
-        // Spawn control message writer task
-        let transport_clone = transport.clone();
-        let protocol_clone = protocol.clone();
-        tokio::spawn(async move {
-            Self::control_writer_task(transport_clone, protocol_clone, control_rx).await;
-        });
-
-        // Spawn hook handler task if hook manager is configured
-        if let Some(ref manager) = hook_manager {
-            let manager_clone = manager.clone();
-            let protocol_clone = protocol.clone();
-            tokio::spawn(async move {
-                Self::hook_handler_task(manager_clone, protocol_clone, hook_rx_internal).await;
-            });
-        }
-
-        // Spawn permission handler task if permission manager is configured
-        if let Some(ref manager) = permission_manager {
-            let manager_clone = manager.clone();
-            let protocol_clone = protocol.clone();
-            tokio::spawn(async move {
-                Self::permission_handler_task(
-                    manager_clone,
-                    protocol_clone,
-                    permission_rx_internal,
-                )
-                .await;
-            });
-        }
-
         Ok(Self {
             transport,
-            protocol,
             message_rx,
-            control_tx,
             hook_rx,
             permission_rx,
             hook_manager,
@@ -377,23 +378,30 @@ impl ClaudeSDKClient {
             runtime_max_thinking_tokens: Arc::new(std::sync::Mutex::new(None)),
             message_buffer: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             bound_session_id,
+            pending_control,
+            pending_permissions,
         })
     }
 
     /// Message reader task - reads from transport and processes messages
     ///
-    /// If `hook_manager` is provided, automatically calls `process_message()` on each
-    /// message to trigger registered hooks (`SubagentStart`, `SubagentStop`, etc.)
+    /// Control responses resolve the waiting request, control requests from the CLI are
+    /// answered, and every other message goes to the message channel. If `hook_manager` is
+    /// provided, automatically calls `process_message()` on each message to trigger registered
+    /// hooks (`SubagentStart`, `SubagentStop`, etc.)
     #[allow(clippy::too_many_lines)]
     async fn message_reader_task(ctx: MessageReaderContext) {
         let MessageReaderContext {
             transport,
-            protocol,
             message_tx,
             session_id,
             session_info,
             bound_session_id,
             hook_manager,
+            permission_manager,
+            permission_tx,
+            pending_control,
+            pending_permissions,
             is_resume,
         } = ctx;
         // Get the message receiver from the transport without holding the lock
@@ -403,360 +411,297 @@ impl ClaudeSDKClient {
         };
 
         while let Some(result) = msg_stream.recv().await {
-            match result {
-                Ok(value) => {
-                    // Try to parse as control message first
-                    let protocol_guard = protocol.lock().await;
-                    let value_str = serde_json::to_string(&value).unwrap_or_default();
-                    if let Ok(control_msg) = protocol_guard.deserialize_message(&value_str) {
-                        tracing::trace!("Parsed as control message, consuming internally");
-
-                        match control_msg {
-                            ControlMessage::InitResponse(init_response) => {
-                                if let Err(e) = protocol_guard.handle_init_response(&init_response)
-                                {
-                                    let _ = message_tx.send(Err(e));
-                                    break;
-                                }
-                            }
-                            ControlMessage::Response(response) => {
-                                if let Err(e) = protocol_guard.handle_response(response).await {
-                                    let _ = message_tx.send(Err(e));
-                                }
-                            }
-                            ControlMessage::Request(_) | ControlMessage::Init(_) => {
-                                // Ignore requests and init in client mode
-                            }
-                        }
-                        drop(protocol_guard);
-                        continue;
-                    }
-                    drop(protocol_guard);
-
-                    // Check for control_response (ack from CLI for control_request)
-                    // These are internal protocol messages, not user-facing
-                    if let Some(msg_type) = value.get("type").and_then(|v| v.as_str()) {
-                        if msg_type == "control_response" {
-                            tracing::debug!(
-                                request_id = %value.get("response")
-                                    .and_then(|r| r.get("request_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown"),
-                                "Received control_response (interrupt/setModel/etc ack)"
-                            );
-                            continue;
-                        }
-                    }
-
-                    // Otherwise parse as regular message
-                    tracing::trace!(
-                        preview = %serde_json::to_string(&value).unwrap_or_default().chars().take(100).collect::<String>(),
-                        "Parsing as Message"
-                    );
-
-                    match parse_message(value) {
-                        Ok(msg) => {
-                            tracing::trace!("Parsed message successfully, sending to channel");
-
-                            // Capture session_id from Result messages
-                            if let Message::Result {
-                                session_id: ref sid,
-                                ..
-                            } = msg
-                            {
-                                if let Ok(mut session_guard) = session_id.lock() {
-                                    *session_guard = Some(sid.clone());
-                                }
-                                // Auto-bind to session on first Result (secure by default)
-                                if let Ok(mut bound_guard) = bound_session_id.lock() {
-                                    if bound_guard.is_none() {
-                                        *bound_guard = Some(sid.clone());
-                                    }
-                                }
-                            }
-
-                            // Capture session info from System init message and pass to HookManager
-                            if let Message::System {
-                                ref subtype,
-                                ref data,
-                            } = msg
-                            {
-                                if subtype == "init" {
-                                    let init_session_id = data
-                                        .get("session_id")
-                                        .and_then(|v| v.as_str())
-                                        .map(std::string::ToString::to_string);
-                                    let init_cwd = data
-                                        .get("cwd")
-                                        .and_then(|v| v.as_str())
-                                        .map(std::string::ToString::to_string);
-
-                                    // Update session_id storage
-                                    if let Some(ref sid) = init_session_id {
-                                        if let Ok(mut session_guard) = session_id.lock() {
-                                            *session_guard = Some(SessionId::from(sid.clone()));
-                                        }
-                                    }
-
-                                    // Populate session_info from init data
-                                    if let Ok(mut info_guard) = session_info.lock() {
-                                        *info_guard = Some(SessionInfo::from_init_data(data));
-                                    }
-
-                                    // Update HookManager with session context and trigger SessionStart
-                                    if let Some(ref manager) = hook_manager {
-                                        if let Some(sid) = init_session_id {
-                                            let mut manager_guard = manager.lock().await;
-                                            manager_guard.set_session_context(sid, init_cwd);
-
-                                            // Determine session start source
-                                            let source =
-                                                if is_resume { "resume" } else { "startup" };
-
-                                            // Trigger SessionStart hook
-                                            if let Err(e) =
-                                                manager_guard.trigger_session_start(source).await
-                                            {
-                                                tracing::warn!(error = %e, "SessionStart hook error");
-                                            }
-
-                                            tracing::debug!(
-                                                source = source,
-                                                "Triggered SessionStart hook"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Process message through hook manager if configured
-                            // This triggers SubagentStart, SubagentStop, PreToolUse, PostToolUse hooks
-                            if let Some(ref manager) = hook_manager {
-                                let mut manager_guard = manager.lock().await;
-                                match manager_guard.process_message(&msg).await {
-                                    Ok(outputs) => {
-                                        if !outputs.is_empty() {
-                                            tracing::debug!(
-                                                count = outputs.len(),
-                                                "Hook outputs from message processing"
-                                            );
-                                        }
-                                        // Hook outputs are handled internally by callbacks
-                                        // Future: could send outputs to a channel for external handling
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "Hook processing error");
-                                    }
-                                }
-                            }
-
-                            if message_tx.send(Ok(msg)).is_err() {
-                                tracing::warn!(
-                                    "Failed to send message to channel - receiver dropped"
-                                );
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = ?e, "Failed to parse message");
-                            let _ = message_tx.send(Err(e));
-                        }
-                    }
-                }
+            let value = match result {
+                Ok(value) => value,
                 Err(e) => {
                     let _ = message_tx.send(Err(e));
                     break;
                 }
-            }
-        }
-    }
-
-    /// Control message writer task - writes control requests to transport
-    ///
-    /// Sends control requests using the Claude CLI streaming protocol format:
-    /// ```json
-    /// {"type": "control_request", "request_id": "...", "request": {"subtype": "..."}}
-    /// ```
-    async fn control_writer_task(
-        transport: Arc<Mutex<SubprocessTransport>>,
-        _protocol: Arc<Mutex<ProtocolHandler>>,
-        mut control_rx: mpsc::UnboundedReceiver<ControlRequest>,
-    ) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        while let Some(request) = control_rx.recv().await {
-            // Generate unique request ID matching TypeScript SDK format
-            let request_id = format!(
-                "req_{}_{:x}",
-                REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            );
-
-            // Build the inner request object based on control type
-            let inner_request = match request {
-                ControlRequest::Interrupt { .. } => {
-                    serde_json::json!({"subtype": "interrupt"})
-                }
-                ControlRequest::SendMessage { content, .. } => {
-                    // User messages should go through send_message, not control channel
-                    // But handle it anyway for robustness
-                    serde_json::json!({
-                        "type": "user",
-                        "message": {
-                            "role": "user",
-                            "content": content
-                        }
-                    })
-                }
-                ControlRequest::SetModel { model, .. } => {
-                    serde_json::json!({
-                        "subtype": "set_model",
-                        "model": model
-                    })
-                }
-                ControlRequest::SetPermissionMode { mode, .. } => {
-                    serde_json::json!({
-                        "subtype": "set_permission_mode",
-                        "mode": mode
-                    })
-                }
-                ControlRequest::SetMaxThinkingTokens {
-                    max_thinking_tokens,
-                    ..
-                } => {
-                    serde_json::json!({
-                        "subtype": "set_max_thinking_tokens",
-                        "max_thinking_tokens": max_thinking_tokens
-                    })
-                }
-                ControlRequest::RewindFiles {
-                    user_message_uuid, ..
-                } => {
-                    // Try snake_case format (CLI may use different format than TS SDK)
-                    serde_json::json!({
-                        "subtype": "rewind_files",
-                        "user_message_uuid": user_message_uuid
-                    })
-                }
-                _ => {
-                    // Other control types not yet supported in stream-json mode
-                    tracing::debug!(request = ?request, "Skipping unsupported control request");
+            };
+            let msg = match parse_message(value) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::debug!(error = ?e, "Failed to parse message");
+                    let _ = message_tx.send(Err(e));
                     continue;
                 }
             };
 
-            // Wrap in control_request envelope (matches TypeScript SDK protocol)
-            let control_json = serde_json::json!({
-                "type": "control_request",
-                "request_id": request_id,
-                "request": inner_request
-            });
-
-            if let Ok(json_str) = serde_json::to_string(&control_json) {
-                tracing::debug!(json = %json_str, "Sending control request to CLI");
-                let message_line = format!("{json_str}\n");
-                let mut transport_guard = transport.lock().await;
-                if transport_guard.write(&message_line).await.is_err() {
-                    tracing::error!("Failed to write control request to CLI");
-                    break;
+            match msg {
+                Message::ControlResponse { response } => {
+                    let waiting = pending_control
+                        .lock()
+                        .ok()
+                        .and_then(|mut pending| pending.remove(&response.request_id));
+                    match waiting {
+                        Some(tx) => {
+                            let _ = tx.send(response);
+                        }
+                        None => tracing::debug!(
+                            request_id = %response.request_id,
+                            "control_response without a waiting request"
+                        ),
+                    }
+                    continue;
                 }
-            } else {
-                tracing::error!("Failed to serialize control request");
+                Message::ControlRequest {
+                    request_id,
+                    request,
+                } => {
+                    let transport = transport.clone();
+                    let permission_manager = permission_manager.clone();
+                    let permission_tx = permission_tx.clone();
+                    let pending_permissions = pending_permissions.clone();
+                    tokio::spawn(async move {
+                        Self::answer_control_request(
+                            &transport,
+                            permission_manager,
+                            &permission_tx,
+                            &pending_permissions,
+                            request_id,
+                            request,
+                        )
+                        .await;
+                    });
+                    continue;
+                }
+                Message::ControlCancelRequest { ref request_id } => {
+                    if let Ok(mut pending) = pending_permissions.lock() {
+                        pending.remove(request_id);
+                    }
+                    tracing::debug!(request_id = %request_id, "CLI cancelled a control request");
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Capture session_id from Result messages
+            if let Message::Result {
+                session_id: ref sid,
+                ..
+            } = msg
+            {
+                if let Ok(mut session_guard) = session_id.lock() {
+                    *session_guard = Some(sid.clone());
+                }
+                // Auto-bind to session on first Result (secure by default)
+                if let Ok(mut bound_guard) = bound_session_id.lock() {
+                    if bound_guard.is_none() {
+                        *bound_guard = Some(sid.clone());
+                    }
+                }
+            }
+
+            // Capture session info from System init message and pass to HookManager
+            if let Message::System {
+                ref subtype,
+                ref data,
+            } = msg
+            {
+                if subtype == "init" {
+                    let init_session_id = data
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .map(std::string::ToString::to_string);
+                    let init_cwd = data
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(std::string::ToString::to_string);
+
+                    // Update session_id storage
+                    if let Some(ref sid) = init_session_id {
+                        if let Ok(mut session_guard) = session_id.lock() {
+                            *session_guard = Some(SessionId::from(sid.clone()));
+                        }
+                    }
+
+                    // Populate session_info from init data
+                    if let Ok(mut info_guard) = session_info.lock() {
+                        *info_guard = Some(SessionInfo::from_init_data(data));
+                    }
+
+                    // Update HookManager with session context and trigger SessionStart
+                    if let Some(ref manager) = hook_manager {
+                        if let Some(sid) = init_session_id {
+                            let mut manager_guard = manager.lock().await;
+                            manager_guard.set_session_context(sid, init_cwd);
+
+                            // Determine session start source
+                            let source = if is_resume { "resume" } else { "startup" };
+
+                            // Trigger SessionStart hook
+                            if let Err(e) = manager_guard.trigger_session_start(source).await {
+                                tracing::warn!(error = %e, "SessionStart hook error");
+                            }
+
+                            tracing::debug!(source = source, "Triggered SessionStart hook");
+                        }
+                    }
+                }
+            }
+
+            // Process message through hook manager if configured
+            // This triggers SubagentStart, SubagentStop, PreToolUse, PostToolUse hooks
+            if let Some(ref manager) = hook_manager {
+                let mut manager_guard = manager.lock().await;
+                match manager_guard.process_message(&msg).await {
+                    Ok(outputs) => {
+                        if !outputs.is_empty() {
+                            tracing::debug!(
+                                count = outputs.len(),
+                                "Hook outputs from message processing"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Hook processing error");
+                    }
+                }
+            }
+
+            if message_tx.send(Ok(msg)).is_err() {
+                tracing::warn!("Failed to send message to channel - receiver dropped");
                 break;
             }
         }
-    }
 
-    /// Hook handler task - automatically processes hook events
-    async fn hook_handler_task(
-        manager: Arc<Mutex<HookManager>>,
-        protocol: Arc<Mutex<ProtocolHandler>>,
-        mut hook_rx: mpsc::UnboundedReceiver<(String, HookEvent)>,
-    ) {
-        while let Some((hook_id, event)) = hook_rx.recv().await {
-            // NOTE: This code path handles hook events from the control protocol.
-            // The primary hook flow is through process_message() in message_reader_task,
-            // which properly extracts event data and builds HookContext with session info.
-            // This handler is kept for backwards compatibility with the control protocol.
-            let manager_guard = manager.lock().await;
-            // Build context with session info from manager (if set)
-            let context = manager_guard.build_context();
-
-            match manager_guard
-                .invoke(event, serde_json::json!({}), None, context)
-                .await
-            {
-                Ok(output) => {
-                    drop(manager_guard);
-
-                    // Send hook response
-                    let protocol_guard = protocol.lock().await;
-                    let response = serde_json::to_value(&output).unwrap_or_default();
-                    let _request = protocol_guard.create_hook_response(hook_id, response);
-                    drop(protocol_guard);
-
-                    // Send through control channel would require access to control_tx
-                    // For now, hooks are processed but response sending needs client cooperation
-                    // This is acceptable as hooks are advisory
-                    // In a full implementation, we'd send _request through control_tx
-                    tracing::debug!(event = ?event, "Hook processed");
-                    #[cfg(debug_assertions)]
-                    eprintln!("Hook processed for event {event:?}");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Hook processing error");
-                    #[cfg(debug_assertions)]
-                    eprintln!("Hook processing error: {e}");
-                }
-            }
+        // The CLI is gone: no waiting control request will be answered.
+        if let Ok(mut pending) = pending_control.lock() {
+            pending.clear();
         }
     }
 
-    /// Permission handler task - automatically processes permission requests
-    async fn permission_handler_task(
-        manager: Arc<Mutex<PermissionManager>>,
-        protocol: Arc<Mutex<ProtocolHandler>>,
-        mut permission_rx: mpsc::UnboundedReceiver<(RequestId, PermissionRequest)>,
+    /// Answers one control request from the CLI so it never waits: `can_use_tool` through
+    /// the permission callback (or the manual permission receiver), anything else with an
+    /// error naming the unsupported subtype.
+    async fn answer_control_request(
+        transport: &Arc<Mutex<SubprocessTransport>>,
+        permission_manager: Option<Arc<Mutex<PermissionManager>>>,
+        permission_tx: &mpsc::UnboundedSender<(RequestId, PermissionRequest)>,
+        pending_permissions: &PendingPermissions,
+        request_id: String,
+        request: ControlRequestBody,
     ) {
-        while let Some((request_id, request)) = permission_rx.recv().await {
-            let manager_guard = manager.lock().await;
-
-            match manager_guard
-                .can_use_tool(
-                    request.tool_name.clone(),
-                    request.tool_input.clone(),
-                    request.context.clone(),
-                )
-                .await
-            {
-                Ok(result) => {
-                    drop(manager_guard);
-
-                    // Send permission response
-                    let protocol_guard = protocol.lock().await;
-                    let _request = protocol_guard
-                        .create_permission_response(request_id.clone(), result.clone());
-                    drop(protocol_guard);
-
-                    // Send through control channel would require access to control_tx
-                    // For now, permissions are processed but response sending needs client cooperation
-                    // This is acceptable for the automatic mode
-                    // In a full implementation, we'd send _request through control_tx
-                    tracing::debug!(request_id = %request_id.as_str(), result = ?result, "Permission processed");
-                    #[cfg(debug_assertions)]
-                    eprintln!("Permission {} processed: {:?}", request_id.as_str(), result);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Permission processing error");
-                    #[cfg(debug_assertions)]
-                    eprintln!("Permission processing error: {e}");
+        let answer = match InboundControlRequest::from(request) {
+            InboundControlRequest::CanUseTool(request) => {
+                let context = ToolPermissionContext::new(
+                    request
+                        .permission_suggestions
+                        .clone()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
+                );
+                if let Some(manager) = permission_manager {
+                    let decision = {
+                        let guard = manager.lock().await;
+                        guard
+                            .can_use_tool(
+                                ToolName::new(request.tool_name.clone()),
+                                request.input.clone(),
+                                context,
+                            )
+                            .await
+                    };
+                    match decision {
+                        Ok(result) => ControlResponseBody::success(
+                            request_id,
+                            Some(permission_response_value(&result, &request)),
+                        ),
+                        Err(e) => ControlResponseBody::error(request_id, e.to_string()),
+                    }
+                } else {
+                    // Manual handling: the caller answers with `respond_to_permission`.
+                    let manual = PermissionRequest {
+                        tool_name: ToolName::new(request.tool_name.clone()),
+                        tool_input: request.input.clone(),
+                        context,
+                    };
+                    if let Ok(mut pending) = pending_permissions.lock() {
+                        pending.insert(request_id.clone(), request);
+                    }
+                    if permission_tx
+                        .send((RequestId::new(request_id.clone()), manual))
+                        .is_ok()
+                    {
+                        return;
+                    }
+                    if let Ok(mut pending) = pending_permissions.lock() {
+                        pending.remove(&request_id);
+                    }
+                    ControlResponseBody::error(request_id, "no permission handler is registered")
                 }
             }
+            InboundControlRequest::HookCallback { callback_id, .. } => ControlResponseBody::error(
+                request_id,
+                format!("hook callback {callback_id} is not registered with this SDK"),
+            ),
+            InboundControlRequest::McpMessage { server_name, .. } => ControlResponseBody::error(
+                request_id,
+                format!("SDK MCP server {server_name} is not served by this client"),
+            ),
+            InboundControlRequest::Other(body) => ControlResponseBody::error(
+                request_id,
+                format!("Unsupported control request subtype: {}", body.subtype),
+            ),
+        };
+        let line = ControlResponseEnvelope::new(answer).to_line();
+        if let Err(e) = write_line(transport, &line).await {
+            tracing::warn!(error = %e, "Failed to answer a control request");
         }
+    }
+
+    /// Sends a control request to the CLI and waits up to `timeout` for its answer.
+    ///
+    /// # Errors
+    /// Returns `ControlTimeout` when no answer arrives in time, `ControlProtocol` when the CLI
+    /// exits first or answers with an error, and a transport error when the request cannot be
+    /// written.
+    pub async fn send_control_request(
+        &self,
+        request: ControlRequestBody,
+        timeout: Duration,
+    ) -> Result<ControlResponseBody> {
+        let request_id = next_request_id();
+        let subtype = request.subtype.clone();
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut pending) = self.pending_control.lock() {
+            pending.insert(request_id.clone(), tx);
+        }
+        let line = ControlRequestEnvelope::new(request_id.clone(), request).to_line();
+        if let Err(e) = write_line(&self.transport, &line).await {
+            if let Ok(mut pending) = self.pending_control.lock() {
+                pending.remove(&request_id);
+            }
+            return Err(e);
+        }
+        let answer = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => {
+                return Err(ClaudeError::control_protocol(format!(
+                    "Claude Code exited before answering {subtype}"
+                )));
+            }
+            Err(_) => {
+                if let Ok(mut pending) = self.pending_control.lock() {
+                    pending.remove(&request_id);
+                }
+                return Err(ClaudeError::control_timeout(timeout.as_secs(), subtype));
+            }
+        };
+        if answer.is_success() {
+            Ok(answer)
+        } else {
+            Err(ClaudeError::control_protocol(format!(
+                "{subtype} failed: {}",
+                answer.error.as_deref().unwrap_or("unknown error")
+            )))
+        }
+    }
+
+    /// Sends a control request without waiting for the answer.
+    async fn send_control_request_nowait(&self, request: ControlRequestBody) -> Result<()> {
+        let line = ControlRequestEnvelope::new(next_request_id(), request).to_line();
+        write_line(&self.transport, &line).await
     }
 
     /// Send a message to Claude
@@ -767,10 +712,34 @@ impl ClaudeSDKClient {
     /// # Errors
     /// Returns error if message cannot be sent
     pub async fn send_message(&mut self, content: impl Into<String>) -> Result<()> {
+        self.write_user_message(content.into(), None).await
+    }
+
+    /// Send a message to Claude under a `uuid` you choose.
+    ///
+    /// With `--replay-user-messages` (always on in streaming mode) Claude Code echoes the
+    /// message back, with this `uuid` and `isReplay: true`, once it takes it; a
+    /// [`Message::CommandLifecycle`] with `command_uuid` equal to it reports `queued`,
+    /// `started` and `cancelled`. Use a UUID: the CLI also uses it as the file checkpoint.
+    ///
+    /// # Errors
+    /// Returns error if the message cannot be sent
+    pub async fn send_message_with_uuid(
+        &mut self,
+        content: impl Into<String>,
+        uuid: impl Into<String>,
+    ) -> Result<()> {
+        self.write_user_message(content.into(), Some(uuid.into()))
+            .await
+    }
+
+    async fn write_user_message(
+        &mut self,
+        content_str: String,
+        uuid: Option<String>,
+    ) -> Result<()> {
         // Validate session if bound
         self.validate_session()?;
-
-        let content_str = content.into();
 
         // Trigger UserPromptSubmit hook before sending
         if let Some(ref manager) = self.hook_manager {
@@ -781,17 +750,19 @@ impl ClaudeSDKClient {
         }
 
         // Send a user message in the format the CLI expects
-        let message = serde_json::json!({
+        let mut message = serde_json::json!({
             "type": "user",
             "message": {
                 "role": "user",
                 "content": content_str
             }
         });
+        if let Some(uuid) = uuid {
+            message["uuid"] = serde_json::Value::String(uuid);
+        }
         let message_json = format!("{}\n", serde_json::to_string(&message)?);
 
-        let mut transport = self.transport.lock().await;
-        transport.write(&message_json).await
+        write_line(&self.transport, &message_json).await
     }
 
     // ========================================================================
@@ -951,23 +922,101 @@ impl ClaudeSDKClient {
         }
     }
 
-    /// Send an interrupt signal
+    /// Send an interrupt signal without waiting for the CLI's acknowledgement.
     ///
-    /// **Note**: Interrupt functionality via control messages may not be fully supported
-    /// in all Claude CLI versions. The method demonstrates the SDK's bidirectional
-    /// capability and will send the control message without blocking, but the CLI
-    /// may not process it. Check your CLI version for control message support.
+    /// Writes `{"type":"control_request","request":{"subtype":"interrupt"}}`. The interrupted
+    /// turn ends with a `result` message. Use [`Self::interrupt_and_wait`] to get the CLI's
+    /// answer.
     ///
     /// # Errors
     /// Returns error if interrupt cannot be sent
     pub async fn interrupt(&mut self) -> Result<()> {
-        let protocol = self.protocol.lock().await;
-        let request = protocol.create_interrupt_request();
-        drop(protocol);
+        self.send_control_request_nowait(ControlRequestBody::interrupt())
+            .await
+    }
 
-        self.control_tx
-            .send(request)
-            .map_err(|_| ClaudeError::transport("Control channel closed"))
+    /// Interrupt the current turn and wait for the CLI's `control_response`.
+    ///
+    /// Claude Code 2.1.292 answers `{"still_queued": [...]}`: the user messages still queued
+    /// behind the interrupted turn (see [`ControlResponseBody::still_queued`]).
+    ///
+    /// # Errors
+    /// Returns error if the request cannot be sent, fails, or gets no answer within `timeout`
+    pub async fn interrupt_and_wait(&self, timeout: Duration) -> Result<ControlResponseBody> {
+        self.send_control_request(ControlRequestBody::interrupt(), timeout)
+            .await
+    }
+
+    /// Run the `initialize` handshake and return its data: `commands`, `agents`, `models`
+    /// (with their supported effort levels), `account`, `pid`, `current_permission_mode`, ...
+    ///
+    /// # Errors
+    /// Returns error if the request cannot be sent, fails, or gets no answer within
+    /// [`DEFAULT_CONTROL_TIMEOUT`]
+    pub async fn initialize(&self) -> Result<serde_json::Value> {
+        let answer = self
+            .send_control_request(ControlRequestBody::initialize(), DEFAULT_CONTROL_TIMEOUT)
+            .await?;
+        Ok(answer.response.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Switch the model for later turns (`set_model`); `None` returns to the default.
+    ///
+    /// # Errors
+    /// Returns error if the CLI refuses or does not answer
+    pub async fn change_model(&self, model: Option<String>) -> Result<()> {
+        self.send_control_request(
+            ControlRequestBody::set_model(model.clone()),
+            DEFAULT_CONTROL_TIMEOUT,
+        )
+        .await?;
+        if let Ok(mut guard) = self.runtime_model.lock() {
+            *guard = model;
+        }
+        Ok(())
+    }
+
+    /// Switch the permission mode (`set_permission_mode`).
+    ///
+    /// # Errors
+    /// Returns error if the CLI refuses (e.g. `invalid_mode`) or does not answer
+    pub async fn change_permission_mode(&self, mode: crate::types::PermissionMode) -> Result<()> {
+        self.send_control_request(
+            ControlRequestBody::set_permission_mode(mode),
+            DEFAULT_CONTROL_TIMEOUT,
+        )
+        .await?;
+        if let Ok(mut guard) = self.runtime_permission_mode.lock() {
+            *guard = Some(mode);
+        }
+        Ok(())
+    }
+
+    /// Change the thinking budget (`set_max_thinking_tokens`); `None` turns it off.
+    ///
+    /// # Errors
+    /// Returns error if the CLI refuses or does not answer
+    pub async fn change_max_thinking_tokens(&self, tokens: Option<u32>) -> Result<()> {
+        self.send_control_request(
+            ControlRequestBody::set_max_thinking_tokens(tokens),
+            DEFAULT_CONTROL_TIMEOUT,
+        )
+        .await?;
+        if let Ok(mut guard) = self.runtime_max_thinking_tokens.lock() {
+            *guard = tokens;
+        }
+        Ok(())
+    }
+
+    /// The status of the session's MCP servers (`mcp_status`).
+    ///
+    /// # Errors
+    /// Returns error if the request fails or gets no answer
+    pub async fn mcp_status(&self) -> Result<serde_json::Value> {
+        let answer = self
+            .send_control_request(ControlRequestBody::mcp_status(), DEFAULT_CONTROL_TIMEOUT)
+            .await?;
+        Ok(answer.response.unwrap_or(serde_json::Value::Null))
     }
 
     /// Rewind files to a checkpoint
@@ -1007,13 +1056,8 @@ impl ClaudeSDKClient {
     /// # }
     /// ```
     pub async fn rewind_files(&mut self, user_message_uuid: &str) -> Result<()> {
-        let protocol = self.protocol.lock().await;
-        let request = protocol.create_rewind_files_request(user_message_uuid);
-        drop(protocol);
-
-        self.control_tx
-            .send(request)
-            .map_err(|_| ClaudeError::transport("Control channel closed"))
+        self.send_control_request_nowait(ControlRequestBody::rewind_files(user_message_uuid))
+            .await
     }
 
     /// Get the next message from the stream
@@ -1041,6 +1085,8 @@ impl ClaudeSDKClient {
 
     /// Respond to a hook event
     ///
+    /// Writes a success `control_response` for the CLI request `hook_id` carrying `response`.
+    ///
     /// # Arguments
     /// * `hook_id` - ID of the hook event being responded to
     /// * `response` - Hook response data
@@ -1052,13 +1098,10 @@ impl ClaudeSDKClient {
         hook_id: String,
         response: serde_json::Value,
     ) -> Result<()> {
-        let protocol = self.protocol.lock().await;
-        let request = protocol.create_hook_response(hook_id, response);
-        drop(protocol);
-
-        self.control_tx
-            .send(request)
-            .map_err(|_| ClaudeError::transport("Control channel closed"))
+        let line =
+            ControlResponseEnvelope::new(ControlResponseBody::success(hook_id, Some(response)))
+                .to_line();
+        write_line(&self.transport, &line).await
     }
 
     /// Respond to a permission request
@@ -1074,13 +1117,26 @@ impl ClaudeSDKClient {
         request_id: RequestId,
         result: crate::types::PermissionResult,
     ) -> Result<()> {
-        let protocol = self.protocol.lock().await;
-        let request = protocol.create_permission_response(request_id, result);
-        drop(protocol);
-
-        self.control_tx
-            .send(request)
-            .map_err(|_| ClaudeError::transport("Control channel closed"))
+        let request = self
+            .pending_permissions
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(request_id.as_str()))
+            .ok_or_else(|| {
+                ClaudeError::control_protocol(format!(
+                    "no permission request {} is waiting",
+                    request_id.as_str()
+                ))
+            })?;
+        let answer = ControlResponseBody::success(
+            request_id.as_str(),
+            Some(permission_response_value(&result, &request)),
+        );
+        write_line(
+            &self.transport,
+            &ControlResponseEnvelope::new(answer).to_line(),
+        )
+        .await
     }
 
     /// Receive messages until a Result message is encountered.
@@ -1446,9 +1502,9 @@ impl ClaudeSDKClient {
 
     /// Store a model preference locally.
     ///
-    /// **NOTE:** Runtime model switching mid-session is NOT currently supported
-    /// by the Claude CLI's stream-json protocol. This method only stores the value
-    /// locally for SDK reference. To use a different model, start a new session:
+    /// **NOTE:** This method only stores the value locally. To switch the running
+    /// session's model, use [`Self::change_model`] (the `set_model` control request, which
+    /// Claude Code 2.1.x supports). To pick the model at session start:
     ///
     /// ```rust,no_run
     /// use anthropic_agent_sdk::{ClaudeAgentOptions, ClaudeSDKClient};
@@ -1463,7 +1519,7 @@ impl ClaudeSDKClient {
     /// ```
     pub fn set_model(&self, model: impl Into<String>) {
         let model_str = model.into();
-        tracing::debug!(model = %model_str, "set_model: storing locally (runtime switching not supported)");
+        tracing::debug!(model = %model_str, "set_model: storing locally (use change_model to switch the session)");
 
         if let Ok(mut guard) = self.runtime_model.lock() {
             *guard = Some(model_str);
@@ -1480,9 +1536,8 @@ impl ClaudeSDKClient {
 
     /// Store a permission mode preference locally.
     ///
-    /// **NOTE:** Runtime permission mode switching mid-session is NOT currently
-    /// supported by the Claude CLI's stream-json protocol. This method only stores
-    /// the value locally for SDK reference. To set permission mode, use session options:
+    /// **NOTE:** This method only stores the value locally. To switch the running
+    /// session's mode, use [`Self::change_permission_mode`]. To set it at session start:
     ///
     /// ```rust,no_run
     /// use anthropic_agent_sdk::{ClaudeAgentOptions, ClaudeSDKClient, PermissionMode};
@@ -1502,7 +1557,7 @@ impl ClaudeSDKClient {
     /// - `Plan`: Plan-only mode, no execution
     /// - `BypassPermissions`: Auto-approve all operations (use with caution)
     pub fn set_permission_mode(&self, mode: crate::types::PermissionMode) {
-        tracing::debug!(mode = ?mode, "set_permission_mode: storing locally (runtime switching not supported)");
+        tracing::debug!(mode = ?mode, "set_permission_mode: storing locally");
 
         if let Ok(mut guard) = self.runtime_permission_mode.lock() {
             *guard = Some(mode);
@@ -1519,9 +1574,8 @@ impl ClaudeSDKClient {
 
     /// Store a max thinking tokens preference locally.
     ///
-    /// **NOTE:** Runtime thinking token adjustment mid-session is NOT currently
-    /// supported by the Claude CLI's stream-json protocol. This method only stores
-    /// the value locally for SDK reference. To set thinking tokens, use session options:
+    /// **NOTE:** This method only stores the value locally. To change the running
+    /// session's budget, use [`Self::change_max_thinking_tokens`]. To set it at session start:
     ///
     /// ```rust,no_run
     /// use anthropic_agent_sdk::{ClaudeAgentOptions, ClaudeSDKClient};
@@ -1538,10 +1592,7 @@ impl ClaudeSDKClient {
     /// Extended thinking allows Claude to "think" before responding,
     /// improving quality for complex tasks.
     pub fn set_max_thinking_tokens(&self, tokens: u32) {
-        tracing::debug!(
-            tokens = tokens,
-            "set_max_thinking_tokens: storing locally (runtime switching not supported)"
-        );
+        tracing::debug!(tokens = tokens, "set_max_thinking_tokens: storing locally");
 
         if let Ok(mut guard) = self.runtime_max_thinking_tokens.lock() {
             *guard = Some(tokens);
@@ -1682,6 +1733,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "spawns the real Claude Code CLI"]
     async fn test_client_creation() {
         let options = ClaudeAgentOptions::default();
         let result = ClaudeSDKClient::new(options, None).await;
@@ -1689,6 +1741,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "spawns the real Claude Code CLI"]
     async fn test_session_id_initially_none() {
         let options = ClaudeAgentOptions::default();
         if let Ok(client) = ClaudeSDKClient::new(options, None).await {
@@ -1698,6 +1751,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "spawns the real Claude Code CLI"]
     async fn test_is_connected() {
         let options = ClaudeAgentOptions::default();
         if let Ok(client) = ClaudeSDKClient::new(options, None).await {
