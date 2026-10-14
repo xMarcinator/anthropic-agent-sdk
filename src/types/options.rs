@@ -560,7 +560,8 @@ pub struct ClaudeAgentOptions {
     #[builder(default)]
     pub extra_args: HashMap<String, Option<String>>,
 
-    /// Maximum buffer size for JSON messages (default: 1MB)
+    /// Maximum length of one output line, stdout or stderr (default: 1MB). A longer line is
+    /// drained without being buffered and reported as a decode error.
     #[builder(default, setter(strip_option))]
     pub max_buffer_size: Option<usize>,
 

@@ -3,6 +3,7 @@
 //! This module provides the transport abstraction and implementations for
 //! communicating with the Claude Code CLI process.
 
+pub mod lines;
 pub mod process;
 pub mod subprocess;
 

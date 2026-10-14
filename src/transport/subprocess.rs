@@ -6,12 +6,13 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+use super::lines::{self, Line};
 use super::process::{DirectSpawner, ProcessHandle, ProcessSpawner, SpawnRequest};
 use crate::error::{ClaudeError, Result};
 use crate::types::options::env_name_eq;
@@ -20,6 +21,8 @@ use crate::utils::truncate_for_display;
 use crate::{Transport, VERSION};
 
 const DEFAULT_MAX_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
+/// How long the message stream waits, once the process has exited, for its stderr to end.
+const STDERR_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 // Dangerous environment variables that should not be passed to subprocess
 const DANGEROUS_ENV_VARS: &[&str] = &[
@@ -95,6 +98,8 @@ pub struct SubprocessTransport {
     max_buffer_size: usize,
     reader_task: Option<JoinHandle<()>>,
     stderr_task: Option<JoinHandle<()>>,
+    /// Aborts the stderr task, also once the message reader holds it
+    stderr_abort: Option<AbortHandle>,
     /// Cancellation token for aborting operations (like `AbortController` in JS)
     cancellation_token: CancellationToken,
 }
@@ -162,6 +167,7 @@ impl SubprocessTransport {
             max_buffer_size,
             reader_task: None,
             stderr_task: None,
+            stderr_abort: None,
             cancellation_token: token,
         })
     }
@@ -682,9 +688,11 @@ impl Transport for SubprocessTransport {
         // Spawn task to consume stderr to prevent blocking. Each line goes to the `stderr`
         // callback when one is set, else to the parent's stderr.
         let stderr_callback = self.options.stderr.clone();
+        let max_buffer_size = self.max_buffer_size;
         let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut stderr = BufReader::new(stderr);
+            while let Ok(line) = lines::read_line(&mut stderr, max_buffer_size).await {
+                let Some(line) = line.text() else { break };
                 match stderr_callback {
                     Some(ref callback) => callback(line),
                     None => {
@@ -705,6 +713,7 @@ impl Transport for SubprocessTransport {
         self.stdin = Some(stdin);
         self.stdout = Some(BufReader::new(stdout));
         self.process = Some(ProcessHandle::follow(child));
+        self.stderr_abort = Some(stderr_task.abort_handle());
         self.stderr_task = Some(stderr_task);
         self.ready.store(true, Ordering::SeqCst);
 
@@ -760,6 +769,7 @@ impl Transport for SubprocessTransport {
         let stdout_callback = self.options.stdout.clone();
         let max_buffer_size = self.max_buffer_size;
         let cancel_token = self.cancellation_token.clone();
+        let stderr_task = self.stderr_task.take();
 
         // Spawn background task to read messages
         let task = tokio::spawn(async move {
@@ -771,90 +781,59 @@ impl Transport for SubprocessTransport {
             }
 
             let mut stdout = stdout.unwrap();
-            let mut json_buffer = String::new();
 
             loop {
-                let mut line = String::new();
-
                 // Use select! to allow cancellation - no hardcoded timeout
                 // The caller controls cancellation via the CancellationToken
-                tokio::select! {
-                    // Check for cancellation
+                let line = tokio::select! {
                     () = cancel_token.cancelled() => {
                         tracing::debug!("Read cancelled via CancellationToken");
                         break;
                     }
-                    // Read next line
-                    result = stdout.read_line(&mut line) => {
-                        match result {
-                            Ok(0) => break, // EOF
-                            Ok(_) => {
-                                if let Some(ref callback) = stdout_callback {
-                                    callback(line.trim_end_matches(['\r', '\n']).to_string());
-                                }
-                                let line = line.trim();
-                                if line.is_empty() {
-                                    continue;
-                                }
-
-                                // Accumulate partial JSON until we can parse it
-                                json_buffer.push_str(line);
-
-                                if json_buffer.len() > max_buffer_size {
-                                    // Safe truncation for error preview (respects UTF-8 boundaries)
-                                    let preview = truncate_for_display(&json_buffer, 100);
-                                    let _ = tx.send(Err(ClaudeError::JsonDecode(
-                                        serde_json::Error::io(std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData,
-                                            format!(
-                                                "JSON message exceeded maximum buffer size of {max_buffer_size} bytes. Preview: {preview}"
-                                            ),
-                                        )),
-                                    )));
-                                    json_buffer.clear();
-                                    continue;
-                                }
-
-                                // Try to parse JSON. A line that is not JSON, rather than the
-                                // start of a longer message, is reported and dropped, so it
-                                // cannot swallow the lines after it.
-                                let parsed = serde_json::from_str::<serde_json::Value>(&json_buffer);
-                                let parsed = match parsed {
-                                    Err(e) if !e.is_eof() => {
-                                        json_buffer.clear();
-                                        if tx.send(Err(ClaudeError::JsonDecode(e))).is_err() {
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                    parsed => parsed,
-                                };
-                                if let Ok(data) = parsed {
-                                    let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                    tracing::trace!(msg_type, "Received message from CLI");
-
-                                    // Debug log for result messages
-                                    if msg_type == "result" {
-                                        tracing::debug!(
-                                            "Raw result JSON: {}",
-                                            json_buffer.chars().take(500).collect::<String>()
-                                        );
-                                    }
-
-                                    json_buffer.clear();
-                                    if tx.send(Ok(data)).is_err() {
-                                        // Receiver dropped, stop reading
-                                        break;
-                                    }
-                                }
-                                // else: Not complete yet, continue accumulating
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Err(ClaudeError::Io(e)));
-                                break;
-                            }
-                        }
+                    line = lines::read_line(&mut stdout, max_buffer_size) => line,
+                };
+                let line = match line {
+                    Ok(Line::End) => break,
+                    Ok(line) => line,
+                    Err(e) => {
+                        let _ = tx.send(Err(ClaudeError::Io(e)));
+                        break;
                     }
+                };
+                if let (Some(callback), Some(text)) = (&stdout_callback, line.text()) {
+                    callback(text);
+                }
+                // Each line is one message: a malformed or oversized line is reported and
+                // dropped, and never affects the lines after it.
+                let parsed = match line {
+                    Line::Whole(bytes) if bytes.trim_ascii().is_empty() => continue,
+                    Line::Whole(bytes) => {
+                        serde_json::from_slice::<serde_json::Value>(bytes.trim_ascii())
+                            .map_err(ClaudeError::JsonDecode)
+                    }
+                    Line::Oversized { head, len } => {
+                        let preview = truncate_for_display(&String::from_utf8_lossy(&head), 100);
+                        Err(ClaudeError::JsonDecode(serde_json::Error::io(
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "JSON message of {len} bytes exceeded maximum buffer size of {max_buffer_size} bytes. Preview: {preview}"
+                                ),
+                            ),
+                        )))
+                    }
+                    Line::End => break,
+                };
+                if let Ok(data) = &parsed {
+                    let msg_type = data
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    tracing::trace!(msg_type, "Received message from CLI");
+                }
+                if tx.send(parsed).is_err() {
+                    // Receiver dropped, stop reading
+                    break;
                 }
             }
 
@@ -867,6 +846,11 @@ impl Transport for SubprocessTransport {
                         Some("Check stderr output for details".to_string()),
                     )));
                 }
+            }
+            // The stream ends after the process's last stderr lines reached the callback; a
+            // pipe some grandchild still holds open delays the end by `STDERR_DRAIN` at most.
+            if let Some(task) = stderr_task {
+                let _ = tokio::time::timeout(STDERR_DRAIN, task).await;
             }
         });
 
@@ -899,9 +883,10 @@ impl Transport for SubprocessTransport {
                 () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }
-        if let Some(task) = self.stderr_task.take() {
+        if let Some(task) = self.stderr_abort.take() {
             task.abort();
         }
+        self.stderr_task = None;
 
         self.stdout = None;
 

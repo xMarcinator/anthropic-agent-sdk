@@ -20,7 +20,13 @@ What a host that runs Claude Code sessions for others needs from `ClaudeSDKClien
 
 ### Fixed
 - A stdout line that is not JSON is reported as one `JsonDecode` error and skipped; it no
-  longer swallows the lines after it or ends the client's message stream.
+  longer swallows the lines after it or ends the client's message stream. Each line is parsed
+  on its own: a truncated message (`{`) no longer absorbs the next line.
+- `max_buffer_size` bounds every stdout and stderr line as it is read: a longer line is drained
+  without being held in memory, its head goes to the raw callback, and it is reported as one
+  `JsonDecode` error.
+- The message stream ends only after the process's stderr has reached the `stderr` callback
+  (at most 2 seconds after the process exits, when a grandchild still holds the pipe).
 - `can_use_tool` callbacks run concurrently: the permission manager is no longer locked while
   a callback waits for its answer.
 - A `control_cancel_request` from the CLI drops the pending `can_use_tool` callback's future

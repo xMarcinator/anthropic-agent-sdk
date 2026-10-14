@@ -157,12 +157,26 @@ mod fake {
                 self.assistant("working...");
                 return;
             }
-            if text == "not json" {
-                // A line that is not JSON, then the turn as usual.
-                writeln!(self.out, "not json").unwrap();
+            // A bad line (`raw:` text as it is, `long:` that many bytes), then the turn as usual.
+            let bad = match text.split_once(':') {
+                Some(("raw", line)) => Some(line.to_string()),
+                Some(("long", len)) => Some("x".repeat(len.parse().unwrap())),
+                _ => None,
+            };
+            if let Some(line) = bad {
+                writeln!(self.out, "{line}").unwrap();
                 self.assistant("after the bad line");
                 self.result(uuid, false, "success", None);
                 return;
+            }
+            if let Some(count) = text.strip_prefix("stderr then exit:") {
+                // Diagnostics on stderr as the process ends, with no result.
+                let mut err = std::io::stderr().lock();
+                for at in 0..count.parse::<usize>().unwrap() {
+                    writeln!(err, "diagnostic {at}").unwrap();
+                }
+                err.flush().unwrap();
+                std::process::exit(0);
             }
             if text == "ask twice" {
                 self.awaiting_permission = Some(uuid.to_string());
@@ -381,6 +395,15 @@ fn main() {
         }),
         ("a_line_that_is_not_json_is_skipped", || {
             Box::pin(a_line_that_is_not_json_is_skipped())
+        }),
+        ("a_truncated_line_does_not_swallow_the_next", || {
+            Box::pin(a_truncated_line_does_not_swallow_the_next())
+        }),
+        ("an_oversized_line_is_drained_and_skipped", || {
+            Box::pin(an_oversized_line_is_drained_and_skipped())
+        }),
+        ("stderr_reaches_its_callback_before_the_stream_ends", || {
+            Box::pin(stderr_reaches_its_callback_before_the_stream_ends())
         }),
         ("permission_requests_are_answered_concurrently", || {
             Box::pin(permission_requests_are_answered_concurrently())
@@ -816,9 +839,12 @@ async fn spawner_stdout_and_exit() {
     assert!(lines.iter().all(|line| !line.ends_with('\n')));
 }
 
-async fn a_line_that_is_not_json_is_skipped() {
-    let mut client = client(fake_options()).await;
-    client.send_message("not json").await.unwrap();
+/// Sends `text`, which makes the fake CLI write one bad line before its turn, and checks that
+/// the line is reported once and the turn after it arrives whole.
+async fn a_bad_line_is_skipped(mut options: ClaudeAgentOptions, text: &str) {
+    options.max_buffer_size = Some(4096);
+    let mut client = client(options).await;
+    client.send_message(text).await.unwrap();
     let mut errors = 0;
     let mut texts = Vec::new();
     loop {
@@ -838,9 +864,41 @@ async fn a_line_that_is_not_json_is_skipped() {
             Ok(_) => {}
         }
     }
-    assert_eq!(errors, 1);
-    assert_eq!(texts, ["after the bad line"]);
+    assert_eq!(errors, 1, "{text}");
+    assert_eq!(texts, ["after the bad line"], "{text}");
     client.close().await.unwrap();
+}
+
+async fn a_line_that_is_not_json_is_skipped() {
+    a_bad_line_is_skipped(fake_options(), "raw:not json").await;
+}
+
+async fn a_truncated_line_does_not_swallow_the_next() {
+    a_bad_line_is_skipped(fake_options(), "raw:{").await;
+}
+
+async fn an_oversized_line_is_drained_and_skipped() {
+    let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut options = fake_options();
+    let seen = lines.clone();
+    options.stdout = Some(Arc::new(move |line| seen.lock().unwrap().push(line)));
+    a_bad_line_is_skipped(options, "long:100000").await;
+    // The raw callback gets the line's head only.
+    let longest = lines.lock().unwrap().iter().map(String::len).max();
+    assert_eq!(longest, Some(4096));
+}
+
+async fn stderr_reaches_its_callback_before_the_stream_ends() {
+    let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut options = fake_options();
+    let seen = lines.clone();
+    options.stderr = Some(Arc::new(move |line| seen.lock().unwrap().push(line)));
+    let mut client = client(options).await;
+    client.send_message("stderr then exit:500").await.unwrap();
+    while let Some(_message) = timeout(WAIT, client.next_message()).await.expect("ends") {}
+    let lines = lines.lock().unwrap();
+    assert_eq!(lines.len(), 500);
+    assert_eq!(lines.last().map(String::as_str), Some("diagnostic 499"));
 }
 
 async fn permission_requests_are_answered_concurrently() {
