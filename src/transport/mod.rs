@@ -13,6 +13,11 @@ use crate::error::Result;
 /// Minimum supported Claude Code CLI version
 pub const MIN_CLI_VERSION: &str = "2.0.60";
 
+/// The Claude Code CLI version this SDK's flags and message types were verified against.
+/// Options added for 2.1.x (`effort`, `permission_prompts`, `forward_subagent_text`, the
+/// `auto`/`manual`/`dontAsk` permission modes) need a CLI at least this recent.
+pub const TESTED_CLI_VERSION: &str = "2.1.292";
+
 /// Transport trait for communicating with Claude Code
 ///
 /// This trait defines the interface for sending and receiving messages

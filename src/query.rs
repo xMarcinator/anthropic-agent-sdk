@@ -128,6 +128,7 @@ mod tests {
     use futures::StreamExt;
 
     #[tokio::test]
+    #[ignore = "spawns the real Claude Code CLI and makes a model call"]
     async fn test_simple_query() {
         let stream = query("What is 2+2?", None).await.unwrap();
         let mut stream = Box::pin(stream);

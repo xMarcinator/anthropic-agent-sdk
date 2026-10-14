@@ -1,8 +1,8 @@
 //! Subprocess transport implementation using Claude Code CLI
 
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -14,7 +14,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{ClaudeError, Result};
-use crate::types::{ClaudeAgentOptions, SystemPrompt};
+use crate::types::options::env_name_eq;
+use crate::types::{ClaudeAgentOptions, ClaudeAuth, SystemPrompt, ToolName};
 use crate::utils::truncate_for_display;
 use crate::{Transport, VERSION};
 
@@ -35,6 +36,30 @@ const DANGEROUS_ENV_VARS: &[&str] = &[
 
 // Allowed extra CLI flags (allowlist approach)
 const ALLOWED_EXTRA_FLAGS: &[&str] = &["timeout", "retries", "log-level", "cache-dir"];
+
+/// An argument list under construction.
+#[derive(Default)]
+struct Args(Vec<OsString>);
+
+impl Args {
+    fn flag(&mut self, flag: impl Into<OsString>) {
+        self.0.push(flag.into());
+    }
+
+    fn pair(&mut self, flag: impl Into<OsString>, value: impl Into<OsString>) {
+        self.0.push(flag.into());
+        self.0.push(value.into());
+    }
+}
+
+/// Tool names joined for `--allowedTools` / `--disallowedTools`.
+fn join_tools(tools: &[ToolName]) -> String {
+    tools
+        .iter()
+        .map(ToolName::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Prompt input type
 #[derive(Debug)]
@@ -113,10 +138,10 @@ impl SubprocessTransport {
             options.output_format.as_ref().map(|f| &f.format_type)
         );
 
-        let cli_path = if let Some(path) = cli_path {
-            path
-        } else {
-            Self::find_cli()?
+        // An explicit path wins, then `path_to_claude_code_executable`, then a search.
+        let cli_path = match cli_path.or_else(|| options.path_to_claude_code_executable.clone()) {
+            Some(path) => path,
+            None => Self::find_cli()?,
         };
 
         let cwd = options.cwd.clone();
@@ -167,157 +192,138 @@ impl SubprocessTransport {
         Err(ClaudeError::cli_not_found())
     }
 
-    /// Build CLI command with all arguments
+    /// The CLI arguments these options and this prompt produce, in order.
+    ///
+    /// # Errors
+    /// Returns `InvalidConfig` for contradictory options (a model context without a model,
+    /// `resume_session_at` without `resume`, `sandbox` together with `settings`, `can_use_tool`
+    /// together with `permission_prompt_tool_name`) or for extra flags outside the allowlist.
     #[allow(clippy::too_many_lines)]
-    fn build_command(&self) -> Result<Command> {
-        let mut cmd = Command::new(&self.cli_path);
+    pub fn command_args(&self) -> Result<Vec<OsString>> {
+        let options = &self.options;
+        let mut args = Args::default();
 
         // Always use --print for non-interactive mode to avoid terminal manipulation
-        cmd.arg("--print");
-
-        cmd.arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose");
+        args.flag("--print");
+        args.pair("--output-format", "stream-json");
+        args.flag("--verbose");
 
         // System prompt
-        if let Some(ref system_prompt) = self.options.system_prompt {
+        if let Some(ref system_prompt) = options.system_prompt {
             match system_prompt {
-                SystemPrompt::String(s) => {
-                    cmd.arg("--system-prompt").arg(s);
-                }
+                SystemPrompt::String(s) => args.pair("--system-prompt", s),
                 SystemPrompt::Preset(preset) => {
                     if let Some(ref append) = preset.append {
-                        cmd.arg("--append-system-prompt").arg(append);
+                        args.pair("--append-system-prompt", append);
                     }
                 }
-                SystemPrompt::File(path) => {
-                    cmd.arg("--system-prompt-file").arg(path);
-                }
+                SystemPrompt::File(path) => args.pair("--system-prompt-file", path),
             }
         }
-
-        // Append system prompt (additional text to append to any system prompt)
-        if let Some(ref append) = self.options.append_system_prompt {
-            cmd.arg("--append-system-prompt").arg(append);
+        if let Some(ref append) = options.append_system_prompt {
+            args.pair("--append-system-prompt", append);
         }
 
-        // Allowed tools
-        if !self.options.allowed_tools.is_empty() {
-            let tools: Vec<String> = self
-                .options
-                .allowed_tools
-                .iter()
-                .map(|t| t.as_str().to_string())
-                .collect();
-            cmd.arg("--allowedTools").arg(tools.join(","));
+        if !options.allowed_tools.is_empty() {
+            args.pair("--allowedTools", join_tools(&options.allowed_tools));
+        }
+        if let Some(max_turns) = options.max_turns {
+            args.pair("--max-turns", max_turns.to_string());
+        }
+        if !options.disallowed_tools.is_empty() {
+            args.pair("--disallowedTools", join_tools(&options.disallowed_tools));
         }
 
-        // Max turns
-        if let Some(max_turns) = self.options.max_turns {
-            cmd.arg("--max-turns").arg(max_turns.to_string());
+        // Model, with an optional context-window variant: `opus` + `1m` -> `opus[1m]`
+        match (&options.model, &options.model_context) {
+            (Some(model), Some(context)) => args.pair("--model", format!("{model}[{context}]")),
+            (Some(model), None) => args.pair("--model", model),
+            (None, Some(context)) => {
+                return Err(ClaudeError::invalid_config(format!(
+                    "model_context ({context}) needs a model"
+                )));
+            }
+            (None, None) => {}
+        }
+        if let Some(effort) = options.effort {
+            args.pair("--effort", effort.as_str());
+        }
+        if let Some(thinking) = options.thinking {
+            args.pair("--thinking", thinking.as_str());
         }
 
-        // Disallowed tools
-        if !self.options.disallowed_tools.is_empty() {
-            let tools: Vec<String> = self
-                .options
-                .disallowed_tools
-                .iter()
-                .map(|t| t.as_str().to_string())
-                .collect();
-            cmd.arg("--disallowedTools").arg(tools.join(","));
+        // Permissions. A `can_use_tool` callback is answered over stdin (`stdio`), which needs
+        // streaming input.
+        let stdio_permissions =
+            options.can_use_tool.is_some() && matches!(self.prompt, PromptInput::Stream);
+        match (&options.permission_prompt_tool_name, stdio_permissions) {
+            (Some(_), true) => {
+                return Err(ClaudeError::invalid_config(
+                    "can_use_tool and permission_prompt_tool_name both answer permission prompts; set one",
+                ));
+            }
+            (Some(tool), false) => args.pair("--permission-prompt-tool", tool),
+            (None, true) => args.pair("--permission-prompt-tool", "stdio"),
+            (None, false) => {}
         }
-
-        // Model
-        if let Some(ref model) = self.options.model {
-            cmd.arg("--model").arg(model);
+        if let Some(prompts) = options.permission_prompts {
+            args.pair("--permission-prompts", prompts.as_str());
         }
-
-        // Permission prompt tool
-        if let Some(ref tool) = self.options.permission_prompt_tool_name {
-            cmd.arg("--permission-prompt-tool").arg(tool);
-        }
-
-        // Permission mode
-        if let Some(ref mode) = self.options.permission_mode {
-            let mode_str = match mode {
-                crate::types::PermissionMode::Default => "default",
-                crate::types::PermissionMode::AcceptEdits => "acceptEdits",
-                crate::types::PermissionMode::Plan => "plan",
-                crate::types::PermissionMode::BypassPermissions => "bypassPermissions",
-            };
-            cmd.arg("--permission-mode").arg(mode_str);
-
+        if let Some(mode) = options.permission_mode {
+            args.pair("--permission-mode", mode.cli_value());
             // BypassPermissions requires the dangerous skip flag
-            if matches!(mode, crate::types::PermissionMode::BypassPermissions) {
-                cmd.arg("--dangerously-skip-permissions");
+            if mode == crate::types::PermissionMode::BypassPermissions {
+                args.flag("--dangerously-skip-permissions");
             }
         }
-
-        // Continue conversation
-        if self.options.continue_conversation {
-            cmd.arg("--continue");
+        if options.allow_dangerously_skip_permissions {
+            args.flag("--allow-dangerously-skip-permissions");
         }
 
-        // Resume session
-        if let Some(ref session_id) = self.options.resume {
-            cmd.arg("--resume").arg(session_id.as_str());
+        // Sessions
+        if options.continue_conversation {
+            args.flag("--continue");
         }
-
-        // Settings file
-        if let Some(ref settings) = self.options.settings {
-            cmd.arg("--settings").arg(settings);
+        if let Some(ref session_id) = options.resume {
+            args.pair("--resume", session_id.as_str());
         }
-
-        // Add directories
-        for dir in &self.options.add_dirs {
-            cmd.arg("--add-dir").arg(dir);
-        }
-
-        // MCP servers
-        match &self.options.mcp_servers {
-            crate::types::McpServers::Dict(servers) => {
-                if !servers.is_empty() {
-                    let mut config_map = HashMap::new();
-                    for (name, config) in servers {
-                        config_map.insert(name.clone(), Self::serialize_mcp_config(config));
-                    }
-                    let config_json = serde_json::json!({
-                        "mcpServers": config_map
-                    });
-                    cmd.arg("--mcp-config").arg(config_json.to_string());
-                }
+        if let Some(ref resume_at) = options.resume_session_at {
+            if options.resume.is_none() {
+                return Err(ClaudeError::invalid_config(
+                    "resume_session_at needs resume (the CLI requires --resume)",
+                ));
             }
-            crate::types::McpServers::Path(path) => {
-                cmd.arg("--mcp-config").arg(path);
+            args.pair("--resume-session-at", resume_at);
+        }
+        if options.fork_session {
+            args.flag("--fork-session");
+        }
+        if let Some(ref session_id) = options.session_id {
+            args.pair("--session-id", session_id);
+        }
+        if options.no_session_persistence {
+            args.flag("--no-session-persistence");
+        }
+        if let Some(ref name) = options.session_name {
+            args.pair("--name", name);
+        }
+
+        // Settings; sandbox settings travel inside a --settings JSON object
+        match (&options.settings, &options.sandbox) {
+            (Some(_), Some(_)) => {
+                return Err(ClaudeError::invalid_config(
+                    "sandbox is passed as --settings JSON; put it in the settings file instead of setting both",
+                ));
             }
-            crate::types::McpServers::None => {}
+            (Some(settings), None) => args.pair("--settings", settings),
+            (None, Some(sandbox)) => {
+                let settings = serde_json::json!({ "sandbox": sandbox });
+                args.pair("--settings", settings.to_string());
+            }
+            (None, None) => {}
         }
-
-        // Include partial messages
-        if self.options.include_partial_messages {
-            cmd.arg("--include-partial-messages");
-        }
-
-        // Fork session
-        if self.options.fork_session {
-            cmd.arg("--fork-session");
-        }
-
-        // Custom session ID
-        if let Some(ref session_id) = self.options.session_id {
-            cmd.arg("--session-id").arg(session_id);
-        }
-
-        // Agents
-        if let Some(ref agents) = self.options.agents {
-            let agents_json = serde_json::to_string(agents).unwrap_or_default();
-            cmd.arg("--agents").arg(agents_json);
-        }
-
-        // Setting sources
-        if let Some(ref sources) = self.options.setting_sources {
-            let sources_str: Vec<&str> = sources
+        if let Some(ref sources) = options.setting_sources {
+            let sources: Vec<&str> = sources
                 .iter()
                 .map(|s| match s {
                     crate::types::SettingSource::User => "user",
@@ -325,151 +331,113 @@ impl SubprocessTransport {
                     crate::types::SettingSource::Local => "local",
                 })
                 .collect();
-            cmd.arg("--setting-sources").arg(sources_str.join(","));
+            args.pair("--setting-sources", sources.join(","));
         } else {
-            cmd.arg("--setting-sources").arg("");
+            args.pair("--setting-sources", "");
         }
 
-        // User identifier
-        if let Some(ref user) = self.options.user {
-            cmd.arg("--user").arg(user);
+        for dir in &options.add_dirs {
+            args.pair("--add-dir", dir);
         }
 
-        // ====================================================================
-        // New options for TypeScript SDK parity
-        // ====================================================================
-
-        // Max budget in USD
-        if let Some(max_budget) = self.options.max_budget_usd {
-            cmd.arg("--max-budget-usd").arg(max_budget.to_string());
-        }
-
-        // Max thinking tokens
-        if let Some(max_thinking) = self.options.max_thinking_tokens {
-            cmd.arg("--max-thinking-tokens")
-                .arg(max_thinking.to_string());
-        }
-
-        // Fallback model
-        if let Some(ref fallback) = self.options.fallback_model {
-            cmd.arg("--fallback-model").arg(fallback);
-        }
-
-        // JSON schema for structured outputs
-        if let Some(ref output_format) = self.options.output_format {
-            let schema_json = serde_json::to_string(&output_format.schema).unwrap_or_default();
-            tracing::debug!("Adding --json-schema flag with schema: {}", schema_json);
-            cmd.arg("--json-schema").arg(schema_json);
-        }
-
-        // Sandbox settings
-        if let Some(ref sandbox) = self.options.sandbox {
-            if sandbox.enabled == Some(true) {
-                cmd.arg("--sandbox");
-
-                if sandbox.auto_allow_bash_if_sandboxed == Some(true) {
-                    cmd.arg("--sandbox-auto-allow-bash");
-                }
-
-                if let Some(ref excluded) = sandbox.excluded_commands {
-                    cmd.arg("--sandbox-excluded-commands")
-                        .arg(excluded.join(","));
-                }
-
-                if sandbox.allow_unsandboxed_commands == Some(true) {
-                    cmd.arg("--sandbox-allow-unsandboxed");
-                }
-
-                if sandbox.enable_weaker_nested_sandbox == Some(true) {
-                    cmd.arg("--sandbox-weaker-nested");
-                }
-
-                // Network settings
-                if let Some(ref network) = sandbox.network {
-                    if network.allow_local_binding == Some(true) {
-                        cmd.arg("--sandbox-allow-local-binding");
-                    }
-                    if network.allow_all_unix_sockets == Some(true) {
-                        cmd.arg("--sandbox-allow-all-unix-sockets");
-                    }
-                    if let Some(ref unix_sockets) = network.allow_unix_sockets {
-                        cmd.arg("--sandbox-allow-unix-sockets")
-                            .arg(unix_sockets.join(","));
-                    }
-                    if let Some(port) = network.http_proxy_port {
-                        cmd.arg("--sandbox-http-proxy-port").arg(port.to_string());
-                    }
-                    if let Some(port) = network.socks_proxy_port {
-                        cmd.arg("--sandbox-socks-proxy-port").arg(port.to_string());
-                    }
-                }
-
-                // Ignore violations
-                if let Some(ref ignore) = sandbox.ignore_violations {
-                    if let Some(ref files) = ignore.file {
-                        cmd.arg("--sandbox-ignore-file-violations")
-                            .arg(files.join(","));
-                    }
-                    if let Some(ref networks) = ignore.network {
-                        cmd.arg("--sandbox-ignore-network-violations")
-                            .arg(networks.join(","));
-                    }
+        // MCP servers
+        match &options.mcp_servers {
+            crate::types::McpServers::Dict(servers) => {
+                if !servers.is_empty() {
+                    let config_map: serde_json::Map<String, serde_json::Value> = servers
+                        .iter()
+                        .map(|(name, config)| (name.clone(), Self::serialize_mcp_config(config)))
+                        .collect();
+                    let config_json = serde_json::json!({ "mcpServers": config_map });
+                    args.pair("--mcp-config", config_json.to_string());
                 }
             }
+            crate::types::McpServers::Path(path) => args.pair("--mcp-config", path),
+            crate::types::McpServers::None => {}
+        }
+        if options.strict_mcp_config {
+            args.flag("--strict-mcp-config");
         }
 
-        // Plugins (local paths)
-        if let Some(ref plugins) = self.options.plugins {
+        // Output stream contents
+        if options.include_partial_messages {
+            args.flag("--include-partial-messages");
+        }
+        if options.forward_subagent_text {
+            args.flag("--forward-subagent-text");
+        }
+        if options.include_hook_events {
+            args.flag("--include-hook-events");
+        }
+
+        if let Some(ref agents) = options.agents {
+            let agents_json = serde_json::to_string(agents).unwrap_or_default();
+            args.pair("--agents", agents_json);
+        }
+        if let Some(ref agent) = options.agent {
+            args.pair("--agent", agent);
+        }
+
+        // `user` has no CLI flag (2.1.292 rejects `--user`); it is not passed.
+        if options.user.is_some() {
+            tracing::debug!("ClaudeAgentOptions::user is not passed: the CLI has no --user flag");
+        }
+
+        if let Some(max_budget) = options.max_budget_usd {
+            args.pair("--max-budget-usd", max_budget.to_string());
+        }
+        if let Some(max_thinking) = options.max_thinking_tokens {
+            args.pair("--max-thinking-tokens", max_thinking.to_string());
+        }
+        if let Some(ref fallback) = options.fallback_model {
+            args.pair("--fallback-model", fallback);
+        }
+        if let Some(ref output_format) = options.output_format {
+            let schema_json = serde_json::to_string(&output_format.schema).unwrap_or_default();
+            tracing::debug!("Adding --json-schema flag with schema: {}", schema_json);
+            args.pair("--json-schema", schema_json);
+        }
+
+        if let Some(ref plugins) = options.plugins {
             for plugin in plugins {
                 match plugin {
                     crate::types::SdkPluginConfig::Local { path } => {
-                        cmd.arg("--plugin-dir").arg(path);
+                        args.pair("--plugin-dir", path);
                     }
                 }
             }
         }
 
-        // Beta features
-        if let Some(ref betas) = self.options.betas {
-            for beta in betas {
-                let beta_str = match beta {
-                    crate::types::SdkBeta::Context1M => "context-1m-2025-08-07",
-                };
-                cmd.arg("--beta").arg(beta_str);
+        if let Some(ref betas) = options.betas {
+            if !betas.is_empty() {
+                args.flag("--betas");
+                for beta in betas {
+                    args.flag(beta.as_str());
+                }
             }
         }
 
-        // Strict MCP config validation
-        if self.options.strict_mcp_config {
-            cmd.arg("--strict-mcp-config");
+        if options.bare {
+            args.flag("--bare");
         }
-
-        // File checkpointing for rewind support
-        // Enabled via environment variable, not CLI flag
-        if self.options.enable_file_checkpointing {
-            cmd.env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1");
+        if options.restricted {
+            args.flag("--restricted");
         }
-
-        // Resume session at specific message UUID
-        if let Some(ref resume_at) = self.options.resume_session_at {
-            cmd.arg("--resume-at").arg(resume_at);
+        if options.exclude_dynamic_system_prompt_sections {
+            args.flag("--exclude-dynamic-system-prompt-sections");
         }
 
         // Extra args - strict allowlist enforcement
         // Reject any flags not in the allowlist to prevent CLI injection
-        let disallowed: Vec<&String> = self
-            .options
+        let mut disallowed: Vec<&str> = options
             .extra_args
             .keys()
-            .filter(|flag| !ALLOWED_EXTRA_FLAGS.contains(&flag.as_str()))
+            .map(String::as_str)
+            .filter(|flag| !ALLOWED_EXTRA_FLAGS.contains(flag))
             .collect();
-
         if !disallowed.is_empty() {
-            let flags_str = disallowed
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            disallowed.sort_unstable();
+            let flags_str = disallowed.join(", ");
             tracing::warn!(
                 flags = %flags_str,
                 allowed = ?ALLOWED_EXTRA_FLAGS,
@@ -479,30 +447,113 @@ impl SubprocessTransport {
                 "Disallowed CLI flags in extra_args: [{flags_str}]. Allowed flags: {ALLOWED_EXTRA_FLAGS:?}"
             )));
         }
-
-        // All flags are allowed, add them
-        for (flag, value) in &self.options.extra_args {
-            if let Some(v) = value {
-                cmd.arg(format!("--{flag}")).arg(v);
-            } else {
-                cmd.arg(format!("--{flag}"));
+        let mut extra: Vec<_> = options.extra_args.iter().collect();
+        extra.sort();
+        for (flag, value) in extra {
+            match value {
+                Some(v) => args.pair(format!("--{flag}"), v),
+                None => args.flag(format!("--{flag}")),
             }
         }
 
         // Prompt handling based on mode
         match &self.prompt {
             PromptInput::Stream => {
-                // Streaming mode: use --input-format stream-json
-                // --replay-user-messages enables CLI to read stdin during streaming
-                cmd.arg("--input-format").arg("stream-json");
-                cmd.arg("--replay-user-messages");
+                // Streaming mode: stream-json on stdin; the CLI echoes each user message
+                // (with its uuid) once it takes it.
+                args.pair("--input-format", "stream-json");
+                args.flag("--replay-user-messages");
             }
             PromptInput::String(s) => {
                 // String mode: pass the prompt as an argument after --
-                cmd.arg("--").arg(s);
+                args.flag("--");
+                args.flag(s);
             }
         }
 
+        Ok(args.0)
+    }
+
+    /// The environment of the CLI process, built from `parent` (the SDK's own environment).
+    ///
+    /// Starts from the parent variables `env_inheritance` allows, drops inherited credential
+    /// variables when `auth` names one, then adds `env`, the credential, `CLAUDE_CONFIG_DIR`,
+    /// `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING` and the SDK's entrypoint variables.
+    ///
+    /// # Errors
+    /// Returns `InvalidConfig` when `env` sets a variable on the dangerous list.
+    pub fn command_env(
+        &self,
+        parent: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Vec<(String, String)>> {
+        let options = &self.options;
+
+        // Check for dangerous env vars in user-provided options (strict enforcement)
+        let mut dangerous_found: Vec<&str> = options
+            .env
+            .keys()
+            .map(String::as_str)
+            .filter(|key| DANGEROUS_ENV_VARS.iter().any(|d| env_name_eq(d, key)))
+            .collect();
+        if !dangerous_found.is_empty() {
+            dangerous_found.sort_unstable();
+            let vars_str = dangerous_found.join(", ");
+            tracing::warn!(
+                vars = %vars_str,
+                "Rejected dangerous environment variables - possible injection attempt"
+            );
+            return Err(ClaudeError::invalid_config(format!(
+                "Dangerous environment variables detected: [{vars_str}]. These are blocked to prevent injection attacks."
+            )));
+        }
+
+        let credential = options.auth.env_var();
+        let mut env: Vec<(String, String)> = parent
+            .into_iter()
+            .filter(|(name, _)| options.env_inheritance.allows(name))
+            .filter(|(name, _)| {
+                credential.is_none()
+                    || !ClaudeAuth::CREDENTIAL_VARS
+                        .iter()
+                        .any(|var| env_name_eq(var, name))
+            })
+            .collect();
+
+        let mut set = |name: &str, value: String| {
+            env.retain(|(existing, _)| !env_name_eq(existing, name));
+            env.push((name.to_string(), value));
+        };
+        let mut user_env: Vec<_> = options.env.iter().collect();
+        user_env.sort();
+        for (key, value) in user_env {
+            set(key, value.clone());
+        }
+        if let Some((name, value)) = credential {
+            set(name, value.to_string());
+        }
+        if let Some(ref dir) = options.config_dir {
+            set("CLAUDE_CONFIG_DIR", dir.to_string_lossy().into_owned());
+        }
+        if options.enable_file_checkpointing {
+            set("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1".to_string());
+        }
+        if let Some(ref cwd) = self.cwd {
+            set("PWD", cwd.to_string_lossy().into_owned());
+        }
+        set("CLAUDE_CODE_ENTRYPOINT", "sdk-rust".to_string());
+        set("CLAUDE_AGENT_SDK_VERSION", VERSION.to_string());
+        Ok(env)
+    }
+
+    /// Build the CLI command: program, arguments, environment and working directory.
+    fn build_command(&self) -> Result<Command> {
+        let mut cmd = Command::new(&self.cli_path);
+        cmd.args(self.command_args()?);
+        cmd.env_clear();
+        cmd.envs(self.command_env(env::vars())?);
+        if let Some(ref cwd) = self.cwd {
+            cmd.current_dir(cwd);
+        }
         Ok(cmd)
     }
 
@@ -578,47 +629,6 @@ impl Transport for SubprocessTransport {
 
         let mut cmd = self.build_command()?;
 
-        // Set up environment - strict enforcement of dangerous variable blocking
-        let mut process_env = env::vars().collect::<HashMap<_, _>>();
-
-        // Check for dangerous env vars in user-provided options (strict enforcement)
-        let dangerous_found: Vec<&String> = self
-            .options
-            .env
-            .keys()
-            .filter(|key| DANGEROUS_ENV_VARS.contains(&key.as_str()))
-            .collect();
-
-        if !dangerous_found.is_empty() {
-            let vars_str = dangerous_found
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            tracing::warn!(
-                vars = %vars_str,
-                "Rejected dangerous environment variables - possible injection attempt"
-            );
-            return Err(ClaudeError::invalid_config(format!(
-                "Dangerous environment variables detected: [{vars_str}]. These are blocked to prevent injection attacks."
-            )));
-        }
-
-        // All env vars are safe, add them
-        for (key, value) in &self.options.env {
-            process_env.insert(key.clone(), value.clone());
-        }
-
-        process_env.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), "sdk-rust".to_string());
-        process_env.insert("CLAUDE_AGENT_SDK_VERSION".to_string(), VERSION.to_string());
-
-        if let Some(ref cwd) = self.cwd {
-            process_env.insert("PWD".to_string(), cwd.to_string_lossy().to_string());
-            cmd.current_dir(cwd);
-        }
-
-        cmd.envs(process_env);
-
         // Set up stdio
         // IMPORTANT: We pipe stderr instead of inheriting to prevent the child process
         // from manipulating the parent terminal state. Inheriting stderr gives the child
@@ -627,8 +637,9 @@ impl Transport for SubprocessTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()); // Pipe stderr to prevent terminal manipulation
 
-        // Log command for debugging
-        tracing::debug!("CLI command: {:?}", cmd);
+        // Log the program only: arguments and environment can carry secrets (MCP headers,
+        // credentials).
+        tracing::debug!(program = ?self.cli_path, "Starting Claude Code CLI");
 
         // Spawn process
         let mut child = cmd.spawn().map_err(|e| {
@@ -662,19 +673,23 @@ impl Transport for SubprocessTransport {
             .take()
             .ok_or_else(|| ClaudeError::connection("Failed to get stderr handle"))?;
 
-        // Spawn task to consume stderr to prevent blocking
-        // We forward it to parent stderr for visibility
+        // Spawn task to consume stderr to prevent blocking. Each line goes to the `stderr`
+        // callback when one is set, else to the parent's stderr.
+        let stderr_callback = self.options.stderr.clone();
         let stderr_task = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut stderr = stderr;
-            let mut buffer = vec![0u8; 4096];
-
-            loop {
-                match stderr.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        // Forward stderr to parent's stderr
-                        let _ = std::io::Write::write_all(&mut std::io::stderr(), &buffer[..n]);
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                match stderr_callback {
+                    Some(ref callback) => callback(line),
+                    None => {
+                        let _ = std::io::Write::write_all(
+                            &mut std::io::stderr(),
+                            format!(
+                                "{line}
+"
+                            )
+                            .as_bytes(),
+                        );
                     }
                 }
             }
@@ -931,12 +946,49 @@ impl Drop for SubprocessTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{
+        ClaudeAuth, Effort, EnvInheritance, PermissionMode, PermissionPrompts, SandboxSettings,
+        SdkBeta, ThinkingMode,
+    };
+
+    /// A CLI path that is never started: these tests only build arguments and environments.
+    fn fake_cli() -> Option<PathBuf> {
+        Some(PathBuf::from("claude-not-started"))
+    }
+
+    fn transport(prompt: PromptInput, options: ClaudeAgentOptions) -> SubprocessTransport {
+        SubprocessTransport::new(prompt, options, fake_cli()).expect("transport")
+    }
+
+    fn args(options: ClaudeAgentOptions) -> Vec<String> {
+        args_for(PromptInput::Stream, options)
+    }
+
+    fn args_for(prompt: PromptInput, options: ClaudeAgentOptions) -> Vec<String> {
+        transport(prompt, options)
+            .command_args()
+            .expect("valid options")
+            .into_iter()
+            .map(|a| a.into_string().expect("utf-8"))
+            .collect()
+    }
+
+    fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let at = args.iter().position(|a| a == flag)?;
+        args.get(at + 1).map(String::as_str)
+    }
+
+    fn config_error(options: ClaudeAgentOptions) -> String {
+        transport(PromptInput::Stream, options)
+            .command_args()
+            .expect_err("invalid options")
+            .to_string()
+    }
 
     #[test]
     fn test_find_cli() {
         // This will succeed if claude is installed
         let result = SubprocessTransport::find_cli();
-        // We can't assert success because it depends on environment
         println!("CLI search result: {result:?}");
     }
 
@@ -947,34 +999,273 @@ mod tests {
     }
 
     #[test]
-    fn test_extra_args_allowlist_rejects_disallowed() {
-        // Use same CLI discovery as production code
-        let Ok(cli_path) = SubprocessTransport::find_cli() else {
-            return; // Skip if CLI not installed
-        };
+    fn streaming_mode_uses_stream_json_both_ways_and_replays_user_messages() {
+        let args = args(ClaudeAgentOptions::default());
+        assert_eq!(
+            &args[..4],
+            ["--print", "--output-format", "stream-json", "--verbose"]
+        );
+        assert_eq!(value_of(&args, "--input-format"), Some("stream-json"));
+        assert!(args.contains(&"--replay-user-messages".to_string()));
+        assert_eq!(value_of(&args, "--setting-sources"), Some(""));
+    }
 
+    #[test]
+    fn string_mode_passes_the_prompt_after_double_dash() {
+        let args = args_for("hi".into(), ClaudeAgentOptions::default());
+        assert_eq!(&args[args.len() - 2..], ["--", "hi"]);
+        assert!(!args.contains(&"--input-format".to_string()));
+    }
+
+    #[test]
+    fn model_effort_and_context_window() {
+        let args = args(
+            ClaudeAgentOptions::builder()
+                .model("opus")
+                .model_context("1m")
+                .effort(Effort::XHigh)
+                .thinking(ThinkingMode::Adaptive)
+                .build(),
+        );
+        assert_eq!(value_of(&args, "--model"), Some("opus[1m]"));
+        assert_eq!(value_of(&args, "--effort"), Some("xhigh"));
+        assert_eq!(value_of(&args, "--thinking"), Some("adaptive"));
+
+        for (effort, text) in [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::XHigh, "xhigh"),
+            (Effort::Max, "max"),
+        ] {
+            assert_eq!(effort.as_str(), text);
+            assert_eq!(text.parse::<Effort>().unwrap(), effort);
+        }
+        assert!("ultra".parse::<Effort>().is_err());
+
+        let plain = self::args(ClaudeAgentOptions::builder().model("haiku").build());
+        assert_eq!(value_of(&plain, "--model"), Some("haiku"));
+        assert!(
+            config_error(ClaudeAgentOptions::builder().model_context("1m").build())
+                .contains("needs a model")
+        );
+    }
+
+    #[test]
+    fn every_permission_mode_has_its_cli_value() {
+        for (mode, text) in [
+            (PermissionMode::Default, "default"),
+            (PermissionMode::Manual, "manual"),
+            (PermissionMode::AcceptEdits, "acceptEdits"),
+            (PermissionMode::Plan, "plan"),
+            (PermissionMode::Auto, "auto"),
+            (PermissionMode::DontAsk, "dontAsk"),
+            (PermissionMode::BypassPermissions, "bypassPermissions"),
+        ] {
+            let args = args(ClaudeAgentOptions::builder().permission_mode(mode).build());
+            assert_eq!(value_of(&args, "--permission-mode"), Some(text));
+            assert_eq!(
+                args.contains(&"--dangerously-skip-permissions".to_string()),
+                mode == PermissionMode::BypassPermissions
+            );
+            assert_eq!(PermissionMode::from_cli_value(text), Some(mode));
+        }
+        assert_eq!(PermissionMode::Manual.control_value(), "default");
+    }
+
+    #[test]
+    fn permission_prompt_tool_prompts_and_tool_lists() {
+        let args = args(
+            ClaudeAgentOptions::builder()
+                .permission_prompt_tool_name("mcp__tracker__permission_prompt")
+                .permission_prompts(PermissionPrompts::Host)
+                .allowed_tools(vec![ToolName::new("Read"), ToolName::new("Bash(git *)")])
+                .disallowed_tools(vec![ToolName::new("AskUserQuestion")])
+                .allow_dangerously_skip_permissions(true)
+                .build(),
+        );
+        assert_eq!(
+            value_of(&args, "--permission-prompt-tool"),
+            Some("mcp__tracker__permission_prompt")
+        );
+        assert_eq!(value_of(&args, "--permission-prompts"), Some("host"));
+        assert_eq!(value_of(&args, "--allowedTools"), Some("Read,Bash(git *)"));
+        assert_eq!(
+            value_of(&args, "--disallowedTools"),
+            Some("AskUserQuestion")
+        );
+        assert!(args.contains(&"--allow-dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn can_use_tool_answers_over_stdio() {
+        let callback = crate::PermissionManager::callback(|_, _, _| async {
+            Ok(crate::types::PermissionResult::Allow(
+                crate::types::PermissionResultAllow {
+                    updated_input: None,
+                    updated_permissions: None,
+                },
+            ))
+        });
+        let options = ClaudeAgentOptions::builder()
+            .can_use_tool(callback.clone())
+            .build();
+        assert_eq!(
+            value_of(&args(options), "--permission-prompt-tool"),
+            Some("stdio")
+        );
+        let both = ClaudeAgentOptions::builder()
+            .can_use_tool(callback)
+            .permission_prompt_tool_name("mcp__x__y")
+            .build();
+        assert!(config_error(both).contains("set one"));
+    }
+
+    #[test]
+    fn sessions_resume_continue_fork_and_persistence() {
+        let args = args(
+            ClaudeAgentOptions::builder()
+                .resume("s1")
+                .resume_session_at("u9")
+                .fork_session(true)
+                .continue_conversation(true)
+                .no_session_persistence(true)
+                .session_name("nightly")
+                .build(),
+        );
+        assert_eq!(value_of(&args, "--resume"), Some("s1"));
+        assert_eq!(value_of(&args, "--resume-session-at"), Some("u9"));
+        assert!(!args.contains(&"--resume-at".to_string()));
+        assert!(args.contains(&"--fork-session".to_string()));
+        assert!(args.contains(&"--continue".to_string()));
+        assert!(args.contains(&"--no-session-persistence".to_string()));
+        assert_eq!(value_of(&args, "--name"), Some("nightly"));
+        assert!(
+            config_error(
+                ClaudeAgentOptions::builder()
+                    .resume_session_at("u9")
+                    .build()
+            )
+            .contains("needs resume")
+        );
+    }
+
+    #[test]
+    fn test_session_id_option_maps_to_cli_arg() {
+        let args = args(
+            ClaudeAgentOptions::builder()
+                .session_id("550e8400-e29b-41d4-a716-446655440000")
+                .build(),
+        );
+        assert_eq!(
+            value_of(&args, "--session-id"),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn mcp_config_strict_and_add_dirs() {
+        let args = args(
+            ClaudeAgentOptions::builder()
+                .mcp_servers(crate::types::McpServers::Path(PathBuf::from("mcp.json")))
+                .strict_mcp_config(true)
+                .add_dirs(vec![PathBuf::from("a"), PathBuf::from("b")])
+                .build(),
+        );
+        assert_eq!(value_of(&args, "--mcp-config"), Some("mcp.json"));
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        let dirs: Vec<_> = args
+            .windows(2)
+            .filter(|w| w[0] == "--add-dir")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(dirs, ["a", "b"]);
+    }
+
+    #[test]
+    fn stream_content_flags() {
+        let args = args(
+            ClaudeAgentOptions::builder()
+                .include_partial_messages(true)
+                .forward_subagent_text(true)
+                .include_hook_events(true)
+                .bare(true)
+                .restricted(true)
+                .exclude_dynamic_system_prompt_sections(true)
+                .agent("reviewer")
+                .build(),
+        );
+        for flag in [
+            "--include-partial-messages",
+            "--forward-subagent-text",
+            "--include-hook-events",
+            "--bare",
+            "--restricted",
+            "--exclude-dynamic-system-prompt-sections",
+        ] {
+            assert!(args.contains(&flag.to_string()), "{flag} missing");
+        }
+        assert_eq!(value_of(&args, "--agent"), Some("reviewer"));
+    }
+
+    #[test]
+    fn flags_the_cli_rejects_are_not_built() {
+        // 2.1.292 rejects --user, --beta, --resume-at and every --sandbox* flag.
+        let args = args(
+            ClaudeAgentOptions::builder()
+                .user("someone")
+                .betas(vec![SdkBeta::Context1M])
+                .sandbox(SandboxSettings {
+                    enabled: Some(true),
+                    auto_allow_bash_if_sandboxed: Some(true),
+                    ..SandboxSettings::default()
+                })
+                .build(),
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--user" || a == "--beta" || a.starts_with("--sandbox"))
+        );
+        assert_eq!(value_of(&args, "--betas"), Some("context-1m-2025-08-07"));
+        let settings: serde_json::Value =
+            serde_json::from_str(value_of(&args, "--settings").unwrap()).unwrap();
+        assert_eq!(
+            settings,
+            serde_json::json!({"sandbox": {"enabled": true, "autoAllowBashIfSandboxed": true}})
+        );
+        let both = ClaudeAgentOptions::builder()
+            .settings("settings.json")
+            .sandbox(SandboxSettings::default())
+            .build();
+        assert!(config_error(both).contains("sandbox"));
+    }
+
+    #[test]
+    fn test_plugin_dir_flag_correct() {
+        let args = args(
+            ClaudeAgentOptions::builder()
+                .plugins(vec![crate::types::SdkPluginConfig::Local {
+                    path: "/path/to/plugin".to_string(),
+                }])
+                .build(),
+        );
+        assert_eq!(value_of(&args, "--plugin-dir"), Some("/path/to/plugin"));
+    }
+
+    #[test]
+    fn test_extra_args_allowlist_rejects_disallowed() {
         let mut options = ClaudeAgentOptions::default();
         options
             .extra_args
             .insert("dangerous-flag".to_string(), None);
-
-        let transport = SubprocessTransport::new(PromptInput::Stream, options, Some(cli_path))
-            .expect("Transport creation should succeed");
-
-        let result = transport.build_command();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("Disallowed CLI flags"));
-        assert!(err.to_string().contains("dangerous-flag"));
+        let err = config_error(options);
+        assert!(err.contains("Disallowed CLI flags"));
+        assert!(err.contains("dangerous-flag"));
     }
 
     #[test]
     fn test_extra_args_allowlist_accepts_allowed() {
-        // Use same CLI discovery as production code
-        let Ok(cli_path) = SubprocessTransport::find_cli() else {
-            return; // Skip if CLI not installed
-        };
-
         let mut options = ClaudeAgentOptions::default();
         options
             .extra_args
@@ -982,128 +1273,130 @@ mod tests {
         options
             .extra_args
             .insert("log-level".to_string(), Some("debug".to_string()));
-
-        let transport = SubprocessTransport::new(PromptInput::Stream, options, Some(cli_path))
-            .expect("Transport creation should succeed");
-
-        let result = transport.build_command();
-        assert!(result.is_ok());
+        let args = args(options);
+        assert_eq!(value_of(&args, "--timeout"), Some("30"));
+        assert_eq!(value_of(&args, "--log-level"), Some("debug"));
     }
 
-    #[tokio::test]
-    async fn test_dangerous_env_vars_rejected() {
-        // Use same CLI discovery as production code
-        let Ok(cli_path) = SubprocessTransport::find_cli() else {
-            return; // Skip if CLI not installed
-        };
+    fn env_of(options: ClaudeAgentOptions, parent: &[(&str, &str)]) -> Vec<(String, String)> {
+        transport(PromptInput::Stream, options)
+            .command_env(
+                parent
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+            )
+            .expect("valid env")
+    }
 
+    fn get<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
+    const PARENT: [(&str, &str); 6] = [
+        ("PATH", "/bin"),
+        ("HOME", "/home/u"),
+        ("ANTHROPIC_API_KEY", "parent-key"),
+        ("ANTHROPIC_AUTH_TOKEN", "parent-auth"),
+        ("TRACKER_SECRET", "s3cret"),
+        ("CLAUDE_CODE_USE_BEDROCK", "0"),
+    ];
+
+    #[test]
+    fn env_inherits_everything_by_default() {
+        let env = env_of(ClaudeAgentOptions::default(), &PARENT);
+        assert_eq!(get(&env, "TRACKER_SECRET"), Some("s3cret"));
+        assert_eq!(get(&env, "ANTHROPIC_API_KEY"), Some("parent-key"));
+        assert_eq!(get(&env, "CLAUDE_CODE_ENTRYPOINT"), Some("sdk-rust"));
+        assert_eq!(get(&env, "CLAUDE_AGENT_SDK_VERSION"), Some(crate::VERSION));
+    }
+
+    #[test]
+    fn env_allow_list_with_prefixes() {
+        let options = ClaudeAgentOptions::builder()
+            .env_inheritance(EnvInheritance::Only(vec![
+                "PATH".into(),
+                "HOME".into(),
+                "CLAUDE_*".into(),
+            ]))
+            .config_dir("/runs/r1/claude")
+            .build();
+        let env = env_of(options, &PARENT);
+        assert_eq!(get(&env, "PATH"), Some("/bin"));
+        assert_eq!(get(&env, "CLAUDE_CODE_USE_BEDROCK"), Some("0"));
+        assert_eq!(get(&env, "TRACKER_SECRET"), None);
+        assert_eq!(get(&env, "ANTHROPIC_API_KEY"), None);
+        assert_eq!(get(&env, "CLAUDE_CONFIG_DIR"), Some("/runs/r1/claude"));
+    }
+
+    #[test]
+    fn oauth_token_replaces_every_inherited_credential() {
+        let options = ClaudeAgentOptions::builder()
+            .auth(ClaudeAuth::OAuthToken("setup-token".into()))
+            .build();
+        let env = env_of(options, &PARENT);
+        assert_eq!(get(&env, "CLAUDE_CODE_OAUTH_TOKEN"), Some("setup-token"));
+        assert_eq!(get(&env, "ANTHROPIC_API_KEY"), None);
+        assert_eq!(get(&env, "ANTHROPIC_AUTH_TOKEN"), None);
+        assert_eq!(get(&env, "TRACKER_SECRET"), Some("s3cret"));
+
+        let key = env_of(
+            ClaudeAgentOptions::builder()
+                .auth(ClaudeAuth::ApiKey("sk-test".into()))
+                .build(),
+            &[("CLAUDE_CODE_OAUTH_TOKEN", "old")],
+        );
+        assert_eq!(get(&key, "ANTHROPIC_API_KEY"), Some("sk-test"));
+        assert_eq!(get(&key, "CLAUDE_CODE_OAUTH_TOKEN"), None);
+    }
+
+    #[test]
+    fn credentials_never_reach_debug_output() {
+        let options = ClaudeAgentOptions::builder()
+            .auth(ClaudeAuth::OAuthToken("very-secret".into()))
+            .env([("X_TOKEN".to_string(), "env-secret".to_string())].into())
+            .build();
+        let text = format!("{options:?}");
+        assert!(!text.contains("very-secret"));
+        assert!(!text.contains("env-secret"));
+        assert!(text.contains("OAuthToken(<redacted>)"));
+    }
+
+    #[test]
+    fn test_dangerous_env_vars_rejected() {
         let mut options = ClaudeAgentOptions::default();
         options
             .env
             .insert("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string());
-
-        let mut transport = SubprocessTransport::new(PromptInput::Stream, options, Some(cli_path))
-            .expect("Transport creation should succeed");
-
-        let result = transport.connect().await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("Dangerous environment variables"));
-        assert!(err.to_string().contains("LD_PRELOAD"));
+        let err = transport(PromptInput::Stream, options)
+            .command_env(Vec::new())
+            .expect_err("rejected")
+            .to_string();
+        assert!(err.contains("Dangerous environment variables"));
+        assert!(err.contains("LD_PRELOAD"));
     }
 
-    #[tokio::test]
-    async fn test_safe_env_vars_accepted() {
-        // Use same CLI discovery as production code
-        let Ok(cli_path) = SubprocessTransport::find_cli() else {
-            return; // Skip if CLI not installed
-        };
-
+    #[test]
+    fn test_safe_env_vars_accepted() {
         let mut options = ClaudeAgentOptions::default();
         options
             .env
             .insert("MY_SAFE_VAR".to_string(), "safe value".to_string());
-
-        let mut transport = SubprocessTransport::new(PromptInput::Stream, options, Some(cli_path))
-            .expect("Transport creation should succeed");
-
-        // Connect should succeed (env vars are safe)
-        let result = transport.connect().await;
-        assert!(result.is_ok());
-
-        // Cleanup
-        transport.close().await.ok();
+        let env = env_of(options, &[("MY_SAFE_VAR", "parent")]);
+        assert_eq!(get(&env, "MY_SAFE_VAR"), Some("safe value"));
+        assert_eq!(env.iter().filter(|(k, _)| k == "MY_SAFE_VAR").count(), 1);
     }
 
     #[test]
-    fn test_session_id_option_maps_to_cli_arg() {
-        let Ok(cli_path) = SubprocessTransport::find_cli() else {
-            return; // Skip if CLI not installed
-        };
-
-        let options = ClaudeAgentOptions::builder()
-            .session_id("550e8400-e29b-41d4-a716-446655440000")
-            .build();
-
-        let transport = SubprocessTransport::new(PromptInput::Stream, options, Some(cli_path))
-            .expect("Transport creation should succeed");
-
-        let cmd = transport
-            .build_command()
-            .expect("build_command should succeed");
-        // Convert tokio Command to std Command to access get_args()
-        let std_cmd = cmd.as_std();
-        let args: Vec<String> = std_cmd
-            .get_args()
-            .filter_map(|a| a.to_str().map(String::from))
-            .collect();
-
-        // Find --session-id flag
-        let session_id_idx = args.iter().position(|a| a == "--session-id");
-        assert!(
-            session_id_idx.is_some(),
-            "Expected --session-id flag in args"
+    fn file_checkpointing_is_an_env_var() {
+        let env = env_of(
+            ClaudeAgentOptions::builder()
+                .enable_file_checkpointing(true)
+                .build(),
+            &[],
         );
-
-        // Verify the value follows the flag
-        let value = &args[session_id_idx.unwrap() + 1];
-        assert_eq!(value, "550e8400-e29b-41d4-a716-446655440000");
-    }
-
-    #[test]
-    fn test_plugin_dir_flag_correct() {
-        let Ok(cli_path) = SubprocessTransport::find_cli() else {
-            return; // Skip if CLI not installed
-        };
-
-        let options = ClaudeAgentOptions::builder()
-            .plugins(vec![crate::types::SdkPluginConfig::Local {
-                path: "/path/to/plugin".to_string(),
-            }])
-            .build();
-
-        let transport = SubprocessTransport::new(PromptInput::Stream, options, Some(cli_path))
-            .expect("Transport creation should succeed");
-
-        let cmd = transport
-            .build_command()
-            .expect("build_command should succeed");
-        // Convert tokio Command to std Command to access get_args()
-        let std_cmd = cmd.as_std();
-        let args: Vec<String> = std_cmd
-            .get_args()
-            .filter_map(|a| a.to_str().map(String::from))
-            .collect();
-
-        // Should use --plugin-dir, not --plugin
-        let plugin_dir_idx = args.iter().position(|a| a == "--plugin-dir");
-        assert!(
-            plugin_dir_idx.is_some(),
-            "Expected --plugin-dir flag in args, got: {args:?}"
+        assert_eq!(
+            get(&env, "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"),
+            Some("1")
         );
-
-        // Verify the value follows the flag
-        let value = &args[plugin_dir_idx.unwrap() + 1];
-        assert_eq!(value, "/path/to/plugin");
     }
 }
