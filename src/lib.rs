@@ -330,6 +330,10 @@ pub use types::{
     SystemPrompt, SystemPromptPreset, ToolName, ToolPermissionContext, UsageData, UsageLimit,
     UserContent,
 };
+pub use types::{
+    ClaudeAuth, Effort, EnvInheritance, PermissionPrompts, RateLimitInfo, RateLimitType,
+    RateLimitWindow, SystemInit, ThinkingMode, Usage,
+};
 
 /// Version of the SDK
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
