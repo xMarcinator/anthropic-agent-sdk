@@ -25,6 +25,8 @@ What a host that runs Claude Code sessions for others needs from `ClaudeSDKClien
   a callback waits for its answer.
 - A `control_cancel_request` from the CLI drops the pending `can_use_tool` callback's future
   instead of answering it later.
+- Dropping the client no longer cuts off stderr: the last lines a process writes before it
+  exits still reach the `stderr` callback.
 
 ## [0.3.0] - 2026-10-14
 

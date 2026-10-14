@@ -936,10 +936,9 @@ impl Drop for SubprocessTransport {
             task.abort();
         }
 
-        // Abort stderr task if running
-        if let Some(task) = self.stderr_task.take() {
-            task.abort();
-        }
+        // The stderr task is left to read to the pipe's end, which comes with the process's:
+        // the last lines a process writes before it exits still reach the stderr callback.
+        drop(self.stderr_task.take());
 
         // Try graceful shutdown first, then kill if needed
         if let Some(process) = self.process.take() {
