@@ -14,13 +14,16 @@ use anthropic_agent_sdk::types::{
     ClaudeAgentOptions, ClaudeAuth, ContentBlock, Effort, Message, PermissionMode,
     PermissionResult, PermissionResultAllow, PermissionResultDeny, RateLimitType,
 };
-use anthropic_agent_sdk::{ClaudeSDKClient, PermissionManager, StreamExt, query};
+use anthropic_agent_sdk::{
+    ClaudeSDKClient, PermissionManager, ProcessSpawner, SpawnRequest, StreamExt, query,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -42,6 +45,7 @@ mod fake {
         awaiting_permission: Option<String>,
         model: Option<String>,
         mode: String,
+        answered: u32,
     }
 
     pub fn run() {
@@ -58,6 +62,7 @@ mod fake {
             awaiting_permission: None,
             model,
             mode,
+            answered: 0,
         };
         // String mode: the prompt follows `--` and stdin is closed.
         if let Some(prompt) = arg_after(&cli.args, "--").map(str::to_string) {
@@ -150,6 +155,36 @@ mod fake {
             if text == "slow" {
                 self.busy = Some(uuid.to_string());
                 self.assistant("working...");
+                return;
+            }
+            if text == "not json" {
+                // A line that is not JSON, then the turn as usual.
+                writeln!(self.out, "not json").unwrap();
+                self.assistant("after the bad line");
+                self.result(uuid, false, "success", None);
+                return;
+            }
+            if text == "ask twice" {
+                self.awaiting_permission = Some(uuid.to_string());
+                for id in ["perm-a", "perm-b"] {
+                    self.emit(
+                        json!({"type": "control_request", "request_id": id, "request": {
+                        "subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": id},
+                        "tool_use_id": format!("toolu_{id}"), "permission_suggestions": []}}),
+                    );
+                }
+                return;
+            }
+            if text == "ask then withdraw" {
+                self.emit(
+                    json!({"type": "control_request", "request_id": "perm-w", "request": {
+                    "subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "rm"},
+                    "tool_use_id": "toolu_w", "permission_suggestions": []}}),
+                );
+                std::thread::sleep(Duration::from_millis(200));
+                self.emit(json!({"type": "control_cancel_request", "request_id": "perm-w"}));
+                self.assistant("withdrawn");
+                self.result(uuid, false, "success", None);
                 return;
             }
             if let Some(tool) = text.strip_prefix("ask:") {
@@ -269,6 +304,21 @@ mod fake {
 
         fn permission_answer(&mut self, value: &Value) {
             let response = &value["response"];
+            if response["request_id"] == "perm-w" {
+                // The withdrawn request must never be answered.
+                self.assistant("answered a withdrawn request");
+                return;
+            }
+            if response["request_id"] == "perm-a" || response["request_id"] == "perm-b" {
+                self.answered += 1;
+                if self.answered == 2 {
+                    if let Some(uuid) = self.awaiting_permission.take() {
+                        self.assistant("both answered");
+                        self.result(&uuid, false, "success", None);
+                    }
+                }
+                return;
+            }
             if response["request_id"] != "perm-1" {
                 return;
             }
@@ -325,6 +375,21 @@ fn main() {
         }),
         ("client_creation_with_invalid_cli", || {
             Box::pin(client_creation_with_invalid_cli())
+        }),
+        ("spawner_stdout_and_exit", || {
+            Box::pin(spawner_stdout_and_exit())
+        }),
+        ("a_line_that_is_not_json_is_skipped", || {
+            Box::pin(a_line_that_is_not_json_is_skipped())
+        }),
+        ("permission_requests_are_answered_concurrently", || {
+            Box::pin(permission_requests_are_answered_concurrently())
+        }),
+        ("a_withdrawn_permission_request_drops_its_callback", || {
+            Box::pin(a_withdrawn_permission_request_drops_its_callback())
+        }),
+        ("a_killed_process_reports_its_exit", || {
+            Box::pin(a_killed_process_reports_its_exit())
         }),
     ];
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -715,4 +780,140 @@ async fn client_creation_with_invalid_cli() {
     )
     .await;
     assert!(result.is_err());
+}
+
+/// Starts the request as it is and counts the starts.
+struct CountingSpawner(std::sync::atomic::AtomicUsize);
+
+impl ProcessSpawner for CountingSpawner {
+    fn spawn(&self, request: SpawnRequest) -> std::io::Result<tokio::process::Child> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        request.command().spawn()
+    }
+}
+
+async fn spawner_stdout_and_exit() {
+    let spawner = Arc::new(CountingSpawner(Default::default()));
+    let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut options = fake_options();
+    options.spawner = Some(spawner.clone());
+    let seen = lines.clone();
+    options.stdout = Some(Arc::new(move |line| seen.lock().unwrap().push(line)));
+    let mut client = client(options).await;
+    assert_eq!(spawner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let process = client.process().expect("a process");
+    assert!(process.id().is_some());
+    assert!(process.exited().is_none());
+    client.send_message("hello").await.unwrap();
+    until_result(&mut client).await;
+    // Closing stdin ends the fake CLI, which exits with 0.
+    client.end_input().await.unwrap();
+    let exit = timeout(WAIT, process.wait()).await.expect("exits");
+    assert_eq!(exit.code, Some(0));
+    assert_eq!(process.exited(), Some(exit));
+    let lines = lines.lock().unwrap();
+    assert!(lines.iter().any(|line| line.contains(r#""type":"result""#)));
+    assert!(lines.iter().all(|line| !line.ends_with('\n')));
+}
+
+async fn a_line_that_is_not_json_is_skipped() {
+    let mut client = client(fake_options()).await;
+    client.send_message("not json").await.unwrap();
+    let mut errors = 0;
+    let mut texts = Vec::new();
+    loop {
+        let message = timeout(WAIT, client.next_message())
+            .await
+            .expect("a message in time")
+            .expect("stream open");
+        match message {
+            Err(_) => errors += 1,
+            Ok(Message::Assistant { message, .. }) => {
+                texts.extend(message.content.into_iter().filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text),
+                    _ => None,
+                }));
+            }
+            Ok(Message::Result { .. }) => break,
+            Ok(_) => {}
+        }
+    }
+    assert_eq!(errors, 1);
+    assert_eq!(texts, ["after the bad line"]);
+    client.close().await.unwrap();
+}
+
+async fn permission_requests_are_answered_concurrently() {
+    // The first answer waits for the second request to arrive: answered one at a time, the
+    // two would never finish.
+    let second = Arc::new(tokio::sync::Notify::new());
+    let mut options = fake_options();
+    let arrived = second.clone();
+    options.can_use_tool = Some(PermissionManager::callback(move |_tool, input, _ctx| {
+        let arrived = arrived.clone();
+        async move {
+            if input["command"] == "perm-a" {
+                arrived.notified().await;
+            } else {
+                arrived.notify_one();
+            }
+            Ok(PermissionResult::Allow(PermissionResultAllow {
+                updated_input: None,
+                updated_permissions: None,
+            }))
+        }
+    }));
+    let mut client = client(options).await;
+    client.send_message("ask twice").await.unwrap();
+    let messages = until_result(&mut client).await;
+    assert!(messages.iter().any(|m| matches!(m, Message::Assistant { message, .. }
+        if matches!(message.content.first(), Some(ContentBlock::Text { text }) if text == "both answered"))));
+    client.close().await.unwrap();
+}
+
+/// Reports when the permission callback's future is dropped.
+struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+async fn a_withdrawn_permission_request_drops_its_callback() {
+    let (sender, dropped) = tokio::sync::oneshot::channel();
+    let guard = Arc::new(std::sync::Mutex::new(Some(Dropped(Some(sender)))));
+    let mut options = fake_options();
+    options.can_use_tool = Some(PermissionManager::callback(move |_tool, _input, _ctx| {
+        let guard = guard.lock().unwrap().take();
+        async move {
+            let _guard = guard;
+            // Never answers on its own.
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }));
+    let mut client = client(options).await;
+    client.send_message("ask then withdraw").await.unwrap();
+    let messages = until_result(&mut client).await;
+    timeout(WAIT, dropped)
+        .await
+        .expect("the callback is dropped")
+        .expect("dropped once");
+    assert!(!messages.iter().any(|m| matches!(m, Message::Assistant { message, .. }
+        if matches!(message.content.first(), Some(ContentBlock::Text { text }) if text.contains("withdrawn request")))));
+    client.close().await.unwrap();
+}
+
+async fn a_killed_process_reports_its_exit() {
+    let mut client = client(fake_options()).await;
+    client.send_message("slow").await.unwrap();
+    let process = client.process().expect("a process");
+    process.kill();
+    let exit = timeout(WAIT, process.wait()).await.expect("exits");
+    assert_ne!(exit.code, Some(0));
+    // The stream ends once the process is gone.
+    while let Some(_message) = timeout(WAIT, client.next_message()).await.expect("ends") {}
 }

@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+What a host that runs Claude Code sessions for others needs from `ClaudeSDKClient`.
+
+### Added
+- `ClaudeAgentOptions::spawner` (`ProcessSpawner`, `SpawnRequest`): the SDK still builds the
+  command and owns the process, but the caller decides how it starts, for example inside a
+  Windows Job Object or a Unix process group, or through a wrapper executable.
+- `ClaudeSDKClient::process()` returns a `ProcessHandle` to wait for the process's exit code
+  or kill it from any task, independent of the message stream.
+- `ClaudeSDKClient::end_input()` closes stdin, so the CLI finishes and exits.
+- `ClaudeAgentOptions::stdout`: a callback with every raw stdout line, for a log.
+
+### Fixed
+- A stdout line that is not JSON is reported as one `JsonDecode` error and skipped; it no
+  longer swallows the lines after it or ends the client's message stream.
+- `can_use_tool` callbacks run concurrently: the permission manager is no longer locked while
+  a callback waits for its answer.
+- A `control_cancel_request` from the CLI drops the pending `can_use_tool` callback's future
+  instead of answering it later.
+
 ## [0.3.0] - 2026-10-14
 
 Brings the SDK up to Claude Code 2.1.292. Flags were checked against `claude --help` and the

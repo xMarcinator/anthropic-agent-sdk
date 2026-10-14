@@ -175,6 +175,10 @@ type PendingControl = Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<Contr
 /// `can_use_tool` requests from the CLI that await a manual answer, by request ID.
 type PendingPermissions = Arc<std::sync::Mutex<HashMap<String, CanUseToolRequest>>>;
 
+/// Control requests from the CLI being answered, by request ID: a `control_cancel_request`
+/// aborts the answer (and so drops the permission callback's future).
+type Answering = Arc<std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>>;
+
 /// How long control requests wait for the CLI's answer by default.
 pub const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -186,7 +190,7 @@ struct MessageReaderContext {
     session_info: Arc<std::sync::Mutex<Option<SessionInfo>>>,
     bound_session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     hook_manager: Option<Arc<Mutex<HookManager>>>,
-    permission_manager: Option<Arc<Mutex<PermissionManager>>>,
+    permission_manager: Option<Arc<PermissionManager>>,
     permission_tx: mpsc::UnboundedSender<(RequestId, PermissionRequest)>,
     pending_control: PendingControl,
     pending_permissions: PendingPermissions,
@@ -236,7 +240,7 @@ pub struct ClaudeSDKClient {
     hook_manager: Option<Arc<Mutex<HookManager>>>,
     /// Permission manager for automatic permission handling (kept alive for background tasks)
     #[allow(dead_code)]
-    permission_manager: Option<Arc<Mutex<PermissionManager>>>,
+    permission_manager: Option<Arc<PermissionManager>>,
     /// Captured session ID from messages
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     /// Session info from init message (model, tools, MCP servers)
@@ -257,6 +261,8 @@ pub struct ClaudeSDKClient {
     pending_control: PendingControl,
     /// `can_use_tool` requests awaiting `respond_to_permission`
     pending_permissions: PendingPermissions,
+    /// The CLI process
+    process: Option<crate::transport::ProcessHandle>,
 }
 
 /// A fresh control request ID, unique within the process.
@@ -316,7 +322,7 @@ impl ClaudeSDKClient {
                 manager.set_allowed_tools(Some(options.allowed_tools.clone()));
             }
             manager.set_disallowed_tools(options.disallowed_tools.clone());
-            (Some(Arc::new(Mutex::new(manager))), None)
+            (Some(Arc::new(manager)), None)
         } else {
             (None, Some(permission_rx_internal))
         };
@@ -335,6 +341,7 @@ impl ClaudeSDKClient {
 
         // Connect transport
         transport.connect().await?;
+        let process = transport.process();
 
         let (message_tx, message_rx) = mpsc::unbounded_channel();
 
@@ -380,6 +387,7 @@ impl ClaudeSDKClient {
             bound_session_id,
             pending_control,
             pending_permissions,
+            process,
         })
     }
 
@@ -404,6 +412,7 @@ impl ClaudeSDKClient {
             pending_permissions,
             is_resume,
         } = ctx;
+        let answering: Answering = Arc::default();
         // Get the message receiver from the transport without holding the lock
         let mut msg_stream = {
             let mut transport_guard = transport.lock().await;
@@ -414,7 +423,13 @@ impl ClaudeSDKClient {
             let value = match result {
                 Ok(value) => value,
                 Err(e) => {
+                    // A line that is not JSON is reported and skipped; anything else ends the
+                    // stream.
+                    let skipped = matches!(e, ClaudeError::JsonDecode(_));
                     let _ = message_tx.send(Err(e));
+                    if skipped {
+                        continue;
+                    }
                     break;
                 }
             };
@@ -452,7 +467,12 @@ impl ClaudeSDKClient {
                     let permission_manager = permission_manager.clone();
                     let permission_tx = permission_tx.clone();
                     let pending_permissions = pending_permissions.clone();
-                    tokio::spawn(async move {
+                    let answers = answering.clone();
+                    let id = request_id.clone();
+                    let key = request_id.clone();
+                    // Registered before the task can finish and deregister itself.
+                    let mut registry = answering.lock().ok();
+                    let task = tokio::spawn(async move {
                         Self::answer_control_request(
                             &transport,
                             permission_manager,
@@ -462,12 +482,26 @@ impl ClaudeSDKClient {
                             request,
                         )
                         .await;
+                        if let Ok(mut answers) = answers.lock() {
+                            answers.remove(&id);
+                        }
                     });
+                    if let Some(registry) = registry.as_mut() {
+                        registry.insert(key, task.abort_handle());
+                    }
                     continue;
                 }
                 Message::ControlCancelRequest { ref request_id } => {
                     if let Ok(mut pending) = pending_permissions.lock() {
                         pending.remove(request_id);
+                    }
+                    // The CLI no longer waits: its permission callback is dropped unanswered.
+                    let answer = answering
+                        .lock()
+                        .ok()
+                        .and_then(|mut answers| answers.remove(request_id));
+                    if let Some(answer) = answer {
+                        answer.abort();
                     }
                     tracing::debug!(request_id = %request_id, "CLI cancelled a control request");
                     continue;
@@ -576,7 +610,7 @@ impl ClaudeSDKClient {
     /// error naming the unsupported subtype.
     async fn answer_control_request(
         transport: &Arc<Mutex<SubprocessTransport>>,
-        permission_manager: Option<Arc<Mutex<PermissionManager>>>,
+        permission_manager: Option<Arc<PermissionManager>>,
         permission_tx: &mpsc::UnboundedSender<(RequestId, PermissionRequest)>,
         pending_permissions: &PendingPermissions,
         request_id: String,
@@ -592,16 +626,15 @@ impl ClaudeSDKClient {
                         .unwrap_or_default(),
                 );
                 if let Some(manager) = permission_manager {
-                    let decision = {
-                        let guard = manager.lock().await;
-                        guard
-                            .can_use_tool(
-                                ToolName::new(request.tool_name.clone()),
-                                request.input.clone(),
-                                context,
-                            )
-                            .await
-                    };
+                    // No lock is held while the callback waits: requests are answered
+                    // concurrently.
+                    let decision = manager
+                        .can_use_tool(
+                            ToolName::new(request.tool_name.clone()),
+                            request.input.clone(),
+                            context,
+                        )
+                        .await;
                     match decision {
                         Ok(result) => ControlResponseBody::success(
                             request_id,
@@ -1058,6 +1091,22 @@ impl ClaudeSDKClient {
     pub async fn rewind_files(&mut self, user_message_uuid: &str) -> Result<()> {
         self.send_control_request_nowait(ControlRequestBody::rewind_files(user_message_uuid))
             .await
+    }
+
+    /// Closes the CLI's stdin: it finishes what it was given and exits. Nothing can be sent
+    /// afterwards, control answers included.
+    ///
+    /// # Errors
+    /// Returns error if stdin cannot be closed
+    pub async fn end_input(&self) -> Result<()> {
+        let mut transport = self.transport.lock().await;
+        transport.end_input().await
+    }
+
+    /// The CLI process: wait for its exit or kill it, from any task.
+    #[must_use]
+    pub fn process(&self) -> Option<crate::transport::ProcessHandle> {
+        self.process.clone()
     }
 
     /// Get the next message from the stream

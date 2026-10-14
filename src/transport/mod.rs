@@ -3,6 +3,7 @@
 //! This module provides the transport abstraction and implementations for
 //! communicating with the Claude Code CLI process.
 
+pub mod process;
 pub mod subprocess;
 
 use async_trait::async_trait;
@@ -119,6 +120,9 @@ fn version_lt(v1: &str, v2: &str) -> bool {
     false
 }
 
+pub use process::{
+    DirectSpawner, ProcessExit, ProcessHandle, ProcessSpawner, SharedSpawner, SpawnRequest,
+};
 pub use subprocess::{PromptInput, SubprocessTransport};
 
 #[cfg(test)]

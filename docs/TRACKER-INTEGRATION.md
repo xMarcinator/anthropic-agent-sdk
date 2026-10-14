@@ -113,3 +113,15 @@ wire format moves into the SDK.
   built from 2.1.292 fixtures.
 - No process is started outside `Launcher`, the MCP config stays a runner-written file, and the
   `permission_prompt` MCP tool and `MCP_TOOL_TIMEOUT` stay as they are.
+
+## Update: the tracker runs on `ClaudeSDKClient`
+
+The tracker chose the client after all (fn-2.102): the SDK owns the process and the protocol.
+The gaps above that blocked it are closed on this branch: `spawner` lets the runner start the
+process inside its Job Object or process group, `process()` gives it the exit code and a kill
+independent of the message stream, `end_input()` closes stdin, `stdout` feeds its raw log, a
+line that is not JSON is skipped, and `can_use_tool` callbacks run concurrently and are dropped
+when the CLI withdraws a request. Permission prompts now come through `can_use_tool`
+(`--permission-prompt-tool stdio`); the tracker's `permission_prompt` MCP tool is gone. The
+tracker passes `setting_sources: [user, project, local]`, so its sessions still load the user's
+settings, and accepts the SDK's own environment variables.

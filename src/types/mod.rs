@@ -59,7 +59,7 @@ pub use options::{
     AgentDefinition, ClaudeAgentOptions, ClaudeAgentOptionsBuilder, ClaudeAuth, Effort,
     EnvInheritance, NetworkSandboxSettings, OutputFormat, PermissionPrompts,
     SandboxIgnoreViolations, SandboxSettings, SdkBeta, SdkPluginConfig, StderrCallback,
-    SystemPrompt, SystemPromptPreset, ThinkingMode, ToolsConfig, ToolsPreset,
+    StdoutCallback, SystemPrompt, SystemPromptPreset, ThinkingMode, ToolsConfig, ToolsPreset,
 };
 pub use permissions::{
     CanUseToolCallback, PermissionBehavior, PermissionMode, PermissionRequest, PermissionResult,

@@ -317,8 +317,8 @@ pub use message::parse_message;
 pub use permissions::{PermissionManager, PermissionManagerBuilder};
 pub use query::query;
 pub use transport::{
-    MIN_CLI_VERSION, PromptInput, SubprocessTransport, TESTED_CLI_VERSION, Transport,
-    check_claude_version,
+    DirectSpawner, MIN_CLI_VERSION, ProcessExit, ProcessHandle, ProcessSpawner, PromptInput,
+    SpawnRequest, SubprocessTransport, TESTED_CLI_VERSION, Transport, check_claude_version,
 };
 pub use types::{
     AgentDefinition, CanUseToolCallback, ClaudeAgentOptions, ClaudeAgentOptionsBuilder,

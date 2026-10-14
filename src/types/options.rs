@@ -143,6 +143,9 @@ use std::sync::Arc;
 /// Useful for debugging and logging purposes.
 pub type StderrCallback = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Callback for each raw stdout line, before it is parsed (without its line ending)
+pub type StdoutCallback = Arc<dyn Fn(String) + Send + Sync>;
+
 // ============================================================================
 // Output Format
 // ============================================================================
@@ -672,6 +675,20 @@ pub struct ClaudeAgentOptions {
     #[builder(default, setter(strip_option))]
     pub stderr: Option<StderrCallback>,
 
+    /// Callback for stdout output
+    ///
+    /// Invoked with every line the CLI writes to stdout, as written, before it is parsed (for
+    /// a raw log). Messages are still parsed and delivered as usual.
+    #[builder(default, setter(strip_option))]
+    pub stdout: Option<StdoutCallback>,
+
+    /// How the CLI process is started (default: [`crate::transport::DirectSpawner`])
+    ///
+    /// A spawner may contain the process (a Job Object, a process group) or start it through a
+    /// wrapper; the SDK still builds the command and owns the process's pipes and exit.
+    #[builder(default, setter(strip_option))]
+    pub spawner: Option<crate::transport::SharedSpawner>,
+
     /// Tools configuration
     ///
     /// Either a list of tool names or a preset (e.g., `ToolsConfig::claude_code_preset()`).
@@ -818,6 +835,8 @@ impl std::fmt::Debug for ClaudeAgentOptions {
                 &self.path_to_claude_code_executable,
             )
             .field("stderr", &self.stderr.as_ref().map(|_| "<callback>"))
+            .field("stdout", &self.stdout.as_ref().map(|_| "<callback>"))
+            .field("spawner", &self.spawner.as_ref().map(|_| "<spawner>"))
             .field(
                 "tools",
                 &self.tools.as_ref().map(|t| match t {

@@ -4,15 +4,15 @@ use async_trait::async_trait;
 use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, mpsc};
+use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::process::{DirectSpawner, ProcessHandle, ProcessSpawner, SpawnRequest};
 use crate::error::{ClaudeError, Result};
 use crate::types::options::env_name_eq;
 use crate::types::{ClaudeAgentOptions, ClaudeAuth, SystemPrompt, ToolName};
@@ -88,7 +88,7 @@ pub struct SubprocessTransport {
     options: ClaudeAgentOptions,
     cli_path: PathBuf,
     cwd: Option<PathBuf>,
-    process: Option<Child>,
+    process: Option<ProcessHandle>,
     stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
     ready: Arc<AtomicBool>,
@@ -545,16 +545,24 @@ impl SubprocessTransport {
         Ok(env)
     }
 
-    /// Build the CLI command: program, arguments, environment and working directory.
-    fn build_command(&self) -> Result<Command> {
-        let mut cmd = Command::new(&self.cli_path);
-        cmd.args(self.command_args()?);
-        cmd.env_clear();
-        cmd.envs(self.command_env(env::vars())?);
-        if let Some(ref cwd) = self.cwd {
-            cmd.current_dir(cwd);
-        }
-        Ok(cmd)
+    /// The CLI command: program, arguments, environment and working directory.
+    ///
+    /// # Errors
+    /// Returns `InvalidConfig` for options [`Self::command_args`] or [`Self::command_env`]
+    /// refuse.
+    pub fn spawn_request(&self) -> Result<SpawnRequest> {
+        Ok(SpawnRequest {
+            program: self.cli_path.clone(),
+            args: self.command_args()?,
+            env: self.command_env(env::vars())?,
+            cwd: self.cwd.clone(),
+        })
+    }
+
+    /// The running process, once connected.
+    #[must_use]
+    pub fn process(&self) -> Option<ProcessHandle> {
+        self.process.clone()
     }
 
     /// Get a child cancellation token for this transport
@@ -627,22 +635,20 @@ impl Transport for SubprocessTransport {
             self.options.output_format.as_ref().map(|f| &f.format_type)
         );
 
-        let mut cmd = self.build_command()?;
-
-        // Set up stdio
-        // IMPORTANT: We pipe stderr instead of inheriting to prevent the child process
-        // from manipulating the parent terminal state. Inheriting stderr gives the child
-        // access to the terminal, which can leave it in a corrupted state.
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()); // Pipe stderr to prevent terminal manipulation
+        // Stdin, stdout and stderr are piped: an inherited stderr would let the child
+        // manipulate the parent terminal's state.
+        let request = self.spawn_request()?;
 
         // Log the program only: arguments and environment can carry secrets (MCP headers,
         // credentials).
         tracing::debug!(program = ?self.cli_path, "Starting Claude Code CLI");
 
-        // Spawn process
-        let mut child = cmd.spawn().map_err(|e| {
+        // Spawn process, through the caller's spawner when there is one
+        let spawned = match &self.options.spawner {
+            Some(spawner) => spawner.spawn(request),
+            None => DirectSpawner.spawn(request),
+        };
+        let mut child = spawned.map_err(|e| {
             if let Some(ref cwd) = self.cwd {
                 if !cwd.exists() {
                     #[cfg(debug_assertions)]
@@ -698,7 +704,7 @@ impl Transport for SubprocessTransport {
         // Store handles
         self.stdin = Some(stdin);
         self.stdout = Some(BufReader::new(stdout));
-        self.process = Some(child);
+        self.process = Some(ProcessHandle::follow(child));
         self.stderr_task = Some(stderr_task);
         self.ready.store(true, Ordering::SeqCst);
 
@@ -748,9 +754,10 @@ impl Transport for SubprocessTransport {
     fn read_messages(&mut self) -> mpsc::UnboundedReceiver<Result<serde_json::Value>> {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // Take ownership of stdout and process
+        // Take ownership of stdout; the process stays shared
         let stdout = self.stdout.take();
-        let process = Arc::new(Mutex::new(self.process.take()));
+        let process = self.process.clone();
+        let stdout_callback = self.options.stdout.clone();
         let max_buffer_size = self.max_buffer_size;
         let cancel_token = self.cancellation_token.clone();
 
@@ -782,6 +789,9 @@ impl Transport for SubprocessTransport {
                         match result {
                             Ok(0) => break, // EOF
                             Ok(_) => {
+                                if let Some(ref callback) = stdout_callback {
+                                    callback(line.trim_end_matches(['\r', '\n']).to_string());
+                                }
                                 let line = line.trim();
                                 if line.is_empty() {
                                     continue;
@@ -805,8 +815,21 @@ impl Transport for SubprocessTransport {
                                     continue;
                                 }
 
-                                // Try to parse JSON
-                                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&json_buffer) {
+                                // Try to parse JSON. A line that is not JSON, rather than the
+                                // start of a longer message, is reported and dropped, so it
+                                // cannot swallow the lines after it.
+                                let parsed = serde_json::from_str::<serde_json::Value>(&json_buffer);
+                                let parsed = match parsed {
+                                    Err(e) if !e.is_eof() => {
+                                        json_buffer.clear();
+                                        if tx.send(Err(ClaudeError::JsonDecode(e))).is_err() {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    parsed => parsed,
+                                };
+                                if let Ok(data) = parsed {
                                     let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
                                     tracing::trace!(msg_type, "Received message from CLI");
 
@@ -836,24 +859,13 @@ impl Transport for SubprocessTransport {
             }
 
             // Check process exit code
-            if let Ok(mut process_guard) = process.try_lock() {
-                if let Some(mut child) = process_guard.take() {
-                    match child.wait().await {
-                        Ok(status) => {
-                            if !status.success() {
-                                if let Some(code) = status.code() {
-                                    let _ = tx.send(Err(ClaudeError::process(
-                                        "Command failed",
-                                        code,
-                                        Some("Check stderr output for details".to_string()),
-                                    )));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(ClaudeError::Io(e)));
-                        }
-                    }
+            if let Some(process) = process {
+                if let Some(code) = process.wait().await.code.filter(|code| *code != 0) {
+                    let _ = tx.send(Err(ClaudeError::process(
+                        "Command failed",
+                        code,
+                        Some("Check stderr output for details".to_string()),
+                    )));
                 }
             }
         });
@@ -894,22 +906,16 @@ impl Transport for SubprocessTransport {
         self.stdout = None;
 
         // Try to wait for the process to exit gracefully first
-        if let Some(mut child) = self.process.take() {
+        if let Some(process) = self.process.take() {
             // Give the process a configurable timeout to exit gracefully
             let timeout_duration = std::time::Duration::from_secs(5);
-
-            match tokio::time::timeout(timeout_duration, child.wait()).await {
-                Ok(Ok(_status)) => {
-                    // Process exited gracefully
-                }
-                Ok(Err(e)) => {
-                    return Err(ClaudeError::Io(e));
-                }
-                Err(_) => {
-                    // Timeout - kill the process
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                }
+            if tokio::time::timeout(timeout_duration, process.wait())
+                .await
+                .is_err()
+            {
+                // Timeout - kill the process
+                process.kill();
+                process.wait().await;
             }
         }
 
@@ -936,9 +942,10 @@ impl Drop for SubprocessTransport {
         }
 
         // Try graceful shutdown first, then kill if needed
-        if let Some(mut child) = self.process.take() {
-            // Try to kill gracefully (SIGTERM on Unix)
-            let _ = child.start_kill();
+        if let Some(process) = self.process.take() {
+            if process.exited().is_none() {
+                process.kill();
+            }
         }
     }
 }
