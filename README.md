@@ -6,12 +6,12 @@ Rust SDK for building AI agents powered by Claude Code. Mirrors the [TypeScript 
 
 **Prerequisites:**
 - Rust 1.85.0+ (edition 2024)
-- Node.js
-- Claude Code 2.0.75+: `npm install -g @anthropic-ai/claude-code`
+- Claude Code 2.0.75+ (flags and messages verified against 2.1.292; the 2.1.x options below
+  need a 2.1.x CLI)
 
 ```toml
 [dependencies]
-anthropic-agent-sdk = "0.2"
+anthropic-agent-sdk = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -37,6 +37,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Claude Code 2.1.x
+
+0.3.0 tracks Claude Code 2.1.292 (see CHANGELOG for the breaking changes):
+
+- Options: `effort` (`low`..`max`), `model_context` (`opus` + `1m` -> `opus[1m]`),
+  `thinking`, `permission_prompts`, `forward_subagent_text`, `include_hook_events`,
+  `no_session_persistence`, `session_name`, `agent`, `bare`, `restricted`, permission modes
+  `Manual`, `Auto` and `DontAsk`.
+- Process environment: `auth` (`ClaudeAuth::ApiKey` or `ClaudeAuth::OAuthToken` from
+  `claude setup-token`, replacing inherited credentials), `config_dir` (`CLAUDE_CONFIG_DIR`)
+  and `env_inheritance` (an allow-list of parent variables).
+- Messages parse forward-compatibly: unknown message types and content blocks arrive as
+  `Message::Other` / `ContentBlock::Other`. New typed messages: `RateLimitEvent` (with
+  `five_hour`, `seven_day` and model-scoped windows), `CommandLifecycle`, `SystemInit` via
+  `Message::as_system_init`, typed `Usage` via `Message::result_usage`.
+- Control protocol: `interrupt_and_wait`, `initialize`, `change_model`,
+  `change_permission_mode`, `change_max_thinking_tokens`, `mcp_status` and
+  `send_control_request` await the CLI's `control_response`; `can_use_tool` callbacks are
+  answered over `--permission-prompt-tool stdio`; `send_message_with_uuid` pairs a message with
+  its `--replay-user-messages` echo.
 
 ## Examples
 

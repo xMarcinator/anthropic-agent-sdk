@@ -4,11 +4,11 @@ resolver = "2"
 
 [workspace.dependencies]
 # SDK - workspace members use this; path for dev, version for publish
-anthropic-agent-sdk = { version = "0.2.75", path = "." }
+anthropic-agent-sdk = { version = "0.3.0", path = "." }
 
 [package]
 name = "anthropic-agent-sdk"
-version = "0.2.75"
+version = "0.3.0"
 edition = "2024"
 authors = ["Angel Bartolli <bartolli@gmail.com>"]
 description = "Rust SDK for Claude Code CLI - streaming queries, hooks, permissions, and MCP integration"

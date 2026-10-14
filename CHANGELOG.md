@@ -5,6 +5,85 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-14
+
+Brings the SDK up to Claude Code 2.1.292. Flags were checked against `claude --help` and the
+CLI's argument parser; message and control shapes against its stream-JSON output.
+
+### Fixed
+- Flags the CLI rejects are no longer built: `--beta` is now `--betas`, `--resume-at` is now
+  `--resume-session-at` (and requires `resume`), `--user` is dropped, and the invented
+  `--sandbox*` flags are replaced by `--settings '{"sandbox": {...}}'` (camelCase keys).
+- `allow_dangerously_skip_permissions` now passes `--allow-dangerously-skip-permissions`.
+- `path_to_claude_code_executable` is now used when no explicit CLI path is given.
+- The `stderr` callback is now called with each stderr line (it was never invoked).
+- `can_use_tool` callbacks now run: the CLI is started with `--permission-prompt-tool stdio`
+  and its `can_use_tool` control requests are answered with a `control_response`. Before, the
+  CLI never asked and its control requests failed to parse.
+- Control responses are correlated by `request_id` instead of being dropped; control requests
+  from the CLI that the SDK cannot serve (`hook_callback`, `mcp_message`, unknown subtypes) are
+  answered with an error so the CLI never waits.
+- Message parsing is forward-compatible: unknown message types, unknown content blocks and
+  known types whose payload changed no longer fail the stream.
+- The CLI command is no longer logged with its arguments and environment (secrets).
+- Unit and integration tests no longer start the real CLI or call a model; the real-CLI tests
+  are `#[ignore]`d and the client tests run against a fake CLI.
+
+### Added
+- Options: `effort` (`Effort::{Low, Medium, High, XHigh, Max}`), `model_context` (`[1m]`
+  suffix), `thinking` (`ThinkingMode`), `permission_prompts` (`PermissionPrompts`),
+  `forward_subagent_text`, `include_hook_events`, `no_session_persistence`, `session_name`,
+  `agent`, `bare`, `restricted`, `exclude_dynamic_system_prompt_sections`.
+- Environment: `auth` (`ClaudeAuth::{Inherit, ApiKey, OAuthToken}`; a set credential replaces
+  inherited `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`),
+  `config_dir` (`CLAUDE_CONFIG_DIR`), `env_inheritance` (`EnvInheritance::Only` allow-list with
+  `PREFIX_*` patterns). `ClaudeAuth` and `env` values are redacted from `Debug`.
+- `PermissionMode::{Manual, Auto, DontAsk}` plus `cli_value`, `control_value` and
+  `from_cli_value`.
+- `SubprocessTransport::command_args` and `command_env` expose the exact argv and environment.
+- Messages: `Message::RateLimitEvent` (`RateLimitInfo`, `RateLimitType`, `RateLimitWindow` with
+  `five_hour`, `seven_day`, model-scoped and future windows), `Message::CommandLifecycle`,
+  `Message::ControlRequest`, `Message::ControlResponse`, `Message::ControlCancelRequest`,
+  `Message::Other`; `ContentBlock::Other`; `SystemInit` (`Message::as_system_init`), typed
+  `Usage` (`Message::result_usage`), `Message::message_type`, `Message::is_replay`.
+- Fields: user `is_replay`, `is_synthetic`, `timestamp`; assistant `uuid`, `error`; assistant
+  content `id`, `stop_reason`, `usage`; result `uuid`, `stop_reason`, `terminal_reason`,
+  `user_message_uuids`, `extra` (every other field, e.g. `fast_mode_state`).
+- `control::wire`: the real stream-JSON control protocol (`ControlRequestBody`,
+  `ControlResponseBody`, envelopes, `CanUseToolRequest`, `InboundControlRequest`).
+- Client: `send_message_with_uuid`, `send_control_request`, `interrupt_and_wait` (returns
+  `still_queued`), `initialize`, `change_model`, `change_permission_mode`,
+  `change_max_thinking_tokens`, `mcp_status`; `respond_to_permission` and `respond_to_hook`
+  now write real `control_response` lines. `DEFAULT_CONTROL_TIMEOUT`, `TESTED_CLI_VERSION`.
+- `tests/fake_cli.rs`: a fake CLI covering replay, interrupt, control and permission
+  round-trips and `query` string mode.
+
+### Changed (breaking)
+- `Message`, `ContentBlock` and `PermissionMode` are `#[non_exhaustive]` and have new variants;
+  exhaustive matches need a wildcard arm.
+- New fields on `Message::User` (`is_replay`, `is_synthetic`, `timestamp`),
+  `Message::Assistant` (`uuid`, `error`) and `Message::Result` (`uuid`, `stop_reason`,
+  `terminal_reason`, `user_message_uuids`, `extra`) and on `AssistantMessageContent` (`id`,
+  `stop_reason`, `usage`): struct literals must set them (`AssistantMessageContent::new` and
+  `Default` help) and patterns without `..` must name them.
+- `ClaudeAgentOptions` has new public fields; struct literals need `..Default::default()`.
+- `SandboxSettings`, `NetworkSandboxSettings` and `SandboxIgnoreViolations` serialize with
+  camelCase keys (the settings-file format).
+- `parse_message` returns `Message::Other` instead of an error for unknown types.
+- `ClaudeAgentOptions::user` is no longer passed to the CLI (it has no such flag).
+- Setting both `sandbox` and `settings`, `model_context` without `model`,
+  `resume_session_at` without `resume`, or `can_use_tool` together with
+  `permission_prompt_tool_name` is now an `InvalidConfig` error.
+- With a `can_use_tool` callback the CLI asks the callback for permission (previously the
+  callback was silently unused).
+- The CLI process gets an explicit environment (`env_clear` + the computed variables); with
+  the default `EnvInheritance::All` the result is the same as before.
+
+### Not yet supported
+- Hook callbacks registered with the CLI through `initialize` (`hook_callback`); hooks are
+  still simulated from the message stream.
+- SDK MCP servers over `mcp_message`; such requests are answered with an error.
+
 ## [0.2.75] - 2025-12-22
 
 ### Added
