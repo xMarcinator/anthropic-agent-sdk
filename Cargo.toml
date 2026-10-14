@@ -74,6 +74,11 @@ chrono = "0.4"
 default = []
 rmcp = ["dep:rmcp", "dep:schemars"]
 
+[[test]]
+name = "fake_cli"
+path = "tests/fake_cli.rs"
+harness = false
+
 [[example]]
 name = "simple_query"
 path = "examples/simple_query.rs"
