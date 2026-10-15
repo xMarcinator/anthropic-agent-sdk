@@ -483,7 +483,7 @@ impl SubprocessTransport {
     /// The environment of the CLI process, built from `parent` (the SDK's own environment).
     ///
     /// Starts from the parent variables `env_inheritance` allows, drops inherited credential
-    /// variables when `auth` names one, then adds `env`, the credential, `CLAUDE_CONFIG_DIR`,
+    /// variables unless `auth` inherits them, then adds `env`, the credential, `CLAUDE_CONFIG_DIR`,
     /// `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING` and the SDK's entrypoint variables.
     ///
     /// # Errors
@@ -514,11 +514,12 @@ impl SubprocessTransport {
         }
 
         let credential = options.auth.env_var();
+        let replaces_inherited = options.auth.replaces_inherited();
         let mut env: Vec<(String, String)> = parent
             .into_iter()
             .filter(|(name, _)| options.env_inheritance.allows(name))
             .filter(|(name, _)| {
-                credential.is_none()
+                !replaces_inherited
                     || !ClaudeAuth::CREDENTIAL_VARS
                         .iter()
                         .any(|var| env_name_eq(var, name))
@@ -1338,6 +1339,28 @@ mod tests {
         );
         assert_eq!(get(&key, "ANTHROPIC_API_KEY"), Some("sk-test"));
         assert_eq!(get(&key, "CLAUDE_CODE_OAUTH_TOKEN"), None);
+    }
+
+    #[test]
+    fn a_login_drops_every_inherited_credential() {
+        let options = ClaudeAgentOptions::builder()
+            .auth(ClaudeAuth::Login)
+            .config_dir("/team/claude")
+            .build();
+        let env = env_of(
+            options,
+            &[
+                ("CLAUDE_CODE_OAUTH_TOKEN", "old"),
+                ("PATH", "/bin"),
+                ("ANTHROPIC_API_KEY", "parent-key"),
+                ("ANTHROPIC_AUTH_TOKEN", "parent-auth"),
+            ],
+        );
+        assert_eq!(get(&env, "CLAUDE_CONFIG_DIR"), Some("/team/claude"));
+        assert_eq!(get(&env, "PATH"), Some("/bin"));
+        for var in ClaudeAuth::CREDENTIAL_VARS {
+            assert_eq!(get(&env, var), None, "{var}");
+        }
     }
 
     #[test]

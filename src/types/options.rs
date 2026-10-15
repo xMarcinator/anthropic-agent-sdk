@@ -378,9 +378,10 @@ impl PermissionPrompts {
 /// How the CLI process authenticates.
 ///
 /// With [`ClaudeAuth::ApiKey`] or [`ClaudeAuth::OAuthToken`] the process receives exactly that
-/// one credential variable; `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
-/// `CLAUDE_CODE_OAUTH_TOKEN` inherited from the parent are dropped, since Claude Code ranks
-/// them above a subscription token. The secret never appears in `Debug` output.
+/// one credential variable, and with [`ClaudeAuth::Login`] none; in all three cases
+/// `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` inherited from the
+/// parent are dropped, since Claude Code ranks them above a subscription token or a login. The
+/// secret never appears in `Debug` output.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub enum ClaudeAuth {
     /// Use whatever the environment and the CLI's own login provide (the default)
@@ -391,6 +392,9 @@ pub enum ClaudeAuth {
     /// A long-lived subscription token from `claude setup-token`, passed as
     /// `CLAUDE_CODE_OAUTH_TOKEN`
     OAuthToken(String),
+    /// The CLI's own login, kept in its configuration folder (see
+    /// `ClaudeAgentOptions::config_dir`); no credential variable is passed or inherited
+    Login,
 }
 
 impl std::fmt::Debug for ClaudeAuth {
@@ -399,6 +403,7 @@ impl std::fmt::Debug for ClaudeAuth {
             Self::Inherit => "Inherit",
             Self::ApiKey(_) => "ApiKey(<redacted>)",
             Self::OAuthToken(_) => "OAuthToken(<redacted>)",
+            Self::Login => "Login",
         })
     }
 }
@@ -411,11 +416,17 @@ impl ClaudeAuth {
         "CLAUDE_CODE_OAUTH_TOKEN",
     ];
 
+    /// Whether inherited credential variables are dropped: every choice but `Inherit`.
+    #[must_use]
+    pub fn replaces_inherited(&self) -> bool {
+        !matches!(self, Self::Inherit)
+    }
+
     /// The variable and value this credential sets, if any.
     #[must_use]
     pub fn env_var(&self) -> Option<(&'static str, &str)> {
         match self {
-            Self::Inherit => None,
+            Self::Inherit | Self::Login => None,
             Self::ApiKey(key) => Some(("ANTHROPIC_API_KEY", key)),
             Self::OAuthToken(token) => Some(("CLAUDE_CODE_OAUTH_TOKEN", token)),
         }
